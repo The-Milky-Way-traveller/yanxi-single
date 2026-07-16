@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "yanxi-single": {
+      "command": "${workspaceFolder}\\yanxi-single\\cmd\\yanxi-mcp\\yanxi-mcp.exe",
+      "args": [],
+      "env": {
+        "DEEPSEEK_API_KEY": "${DEEPSEEK_API_KEY}",
+        "ALIBABA_API_KEY": "${ALIBABA_API_KEY}"
+      }
+    }
+  }
+}

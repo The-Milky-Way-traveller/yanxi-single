@@ -1,0 +1,739 @@
+package validate
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+
+	"yanxi-single/internal/check"
+)
+
+type Result struct {
+	Module    string       `json:"module"`
+	Valid     bool         `json:"valid"`
+	Errors    []string     `json:"errors"`
+	Warnings  []string     `json:"warnings"`
+	Tests     []TestResult `json:"tests"`
+	Imports   interface{}  `json:"imports,omitempty"`
+	Lifecycle *LifecycleResult `json:"lifecycle,omitempty"`
+	BreakingChanges []BreakingChange `json:"breaking_changes,omitempty"`
+	StrictMode      bool             `json:"strict_mode,omitempty"`
+	SideEffects     *SideEffectResult    `json:"side_effects,omitempty"`
+	Benchmarks      []PerformanceResult  `json:"benchmarks,omitempty"`
+	Coverage        *CoverageResult      `json:"coverage,omitempty"`
+	ErrorDecls      []string             `json:"error_declarations,omitempty"`
+	StreamingEntries []string             `json:"streaming_entries,omitempty"`
+	ImportScan      *check.ImportScanResult `json:"import_scan,omitempty"`
+	CallIssues      []string             `json:"call_issues,omitempty"`
+	DeprecatedDeps  []string             `json:"deprecated_deps,omitempty"`
+	MiddlewareIssues []string            `json:"middleware_issues,omitempty"`
+}
+
+type LifecycleResult struct {
+	Setup    *TestResult `json:"setup,omitempty"`
+	Teardown *TestResult `json:"teardown,omitempty"`
+	Health   *TestResult `json:"health,omitempty"`
+}
+
+type TestResult struct {
+	Input    map[string]interface{} `json:"input"`
+	Expected string                 `json:"expected"`
+	Actual   string                 `json:"actual"`
+	Passed   bool                   `json:"passed"`
+	Error    string                 `json:"error,omitempty"`
+	Note     string                 `json:"note,omitempty"`
+}
+
+func ValidateModule(root, modName string) Result {
+	r := Result{Module: modName, Valid: true}
+	modJSONPath := filepath.Join(root, "source", "modules", modName, "module.json")
+	modData, err := os.ReadFile(modJSONPath)
+	if err != nil { r.Valid = false; r.Errors = append(r.Errors, "module.json not found"); return r }
+	var contract map[string]interface{}
+	if json.Unmarshal(modData, &contract) != nil { r.Valid = false; r.Errors = append(r.Errors, "invalid JSON"); return r }
+	for _, f := range []string{"name", "version", "status", "interface"} {
+		if _, ok := contract[f]; !ok { r.Valid = false; r.Errors = append(r.Errors, "Missing '"+f+"'") }
+	}
+
+	// Check if this is a group module
+	if layer, _ := contract["layer"].(string); layer == "group" {
+		children, _ := contract["children"].([]interface{})
+		if len(children) == 0 {
+			r.Valid = false
+			r.Errors = append(r.Errors, "group module has no children")
+			return r
+		}
+		// Recursively validate all children
+		for _, childRaw := range children {
+			childName, _ := childRaw.(string)
+			if childName == "" { continue }
+			childResult := ValidateModule(root, childName)
+			if !childResult.Valid {
+				r.Valid = false
+				r.Errors = append(r.Errors, fmt.Sprintf("child '%s' failed: %v", childName, childResult.Errors))
+			}
+		}
+		return r
+	}
+
+	ifaceRaw, ok := contract["interface"].(map[string]interface{})
+	if !ok { r.Valid = false; r.Errors = append(r.Errors, "interface missing"); return r }
+
+	// Detect multi-entry vs single-entry format
+	var entryList []string
+	if entriesRaw, hasEntries := ifaceRaw["entries"].(map[string]interface{}); hasEntries && len(entriesRaw) > 0 {
+		for k := range entriesRaw {
+			entryList = append(entryList, k)
+		}
+	} else {
+		entry, _ := ifaceRaw["entry"].(string)
+		if entry == "" { entry = "handler" }
+		entryList = []string{entry}
+	}
+
+	lang, _ := contract["language"].(string)
+	if lang == "" { lang = "python" }
+	extMap := map[string]string{"python": "py", "typescript": "ts", "javascript": "js", "go": "go"}
+	ext := extMap[lang]
+	if ext == "" { ext = "py" }
+	implPath := filepath.Join(root, "source", "modules", modName, modName+"."+ext)
+	if _, err := os.Stat(implPath); os.IsNotExist(err) { r.Valid = false; r.Errors = append(r.Errors, "impl not found: "+implPath); return r }
+	implData, err := os.ReadFile(implPath)
+	if err != nil { r.Valid = false; r.Errors = append(r.Errors, "cannot read "+implPath); return r }
+
+	src := string(implData)
+
+	// ── Lifecycle hooks (v5.2.0) ──
+	var lcSetup, lcTeardown, lcHealth string
+	if lcRaw, ok := contract["lifecycle"].(map[string]interface{}); ok {
+		if s, ok := lcRaw["setup"].(string); ok { lcSetup = s }
+		if t, ok := lcRaw["teardown"].(string); ok { lcTeardown = t }
+		if h, ok := lcRaw["health"].(string); ok { lcHealth = h }
+	}
+	for _, fn := range []string{lcSetup, lcTeardown, lcHealth} {
+		if fn == "" { continue }
+		fnRe := regexp.MustCompile(`(def|func|function)\s+` + regexp.QuoteMeta(fn) + `\s*\(`)
+		if !fnRe.MatchString(src) {
+			r.Valid = false
+			r.Errors = append(r.Errors, "Lifecycle function '"+fn+"' not found in source")
+		}
+	}
+	var setupTr *TestResult
+	if lcSetup != "" && r.Valid {
+		tr := runLifecycleTest(root, modName, lcSetup, lang)
+		setupTr = &tr
+		if !tr.Passed { r.Valid = false; r.Errors = append(r.Errors, "setup failed: "+tr.Error) }
+	}
+	r.Lifecycle = &LifecycleResult{Setup: setupTr}
+
+	for _, entry := range entryList {
+		var handlerRe *regexp.Regexp
+		switch lang {
+		case "python": handlerRe = regexp.MustCompile(`def\s+` + regexp.QuoteMeta(entry) + `\s*\(`)
+		case "typescript", "javascript": handlerRe = regexp.MustCompile(`(function\s+` + regexp.QuoteMeta(entry) + `|` + regexp.QuoteMeta(entry) + `\s*[=:]\s*(async\s*)?function|` + regexp.QuoteMeta(entry) + `\s*[=:]\s*\(.*\)\s*=>)`)
+		case "go": handlerRe = regexp.MustCompile(`func\s+` + regexp.QuoteMeta(entry) + `\s*\(`)
+		default: handlerRe = regexp.MustCompile(`def\s+` + regexp.QuoteMeta(entry) + `\s*\(`)
+		}
+		if !handlerRe.MatchString(src) { r.Valid = false; r.Errors = append(r.Errors, "Entry '"+entry+"' not found") }
+	}
+
+	// ── Error declarations (v5.3.0) ──
+	if errDecls, ok := contract["errors"].(map[string]interface{}); ok {
+		for errCode := range errDecls {
+			r.ErrorDecls = append(r.ErrorDecls, errCode)
+		}
+	}
+
+	if !r.Valid { return r } // stop early if handlers missing
+
+	deps, _ := contract["dependencies"].([]interface{})
+	for _, d := range deps {
+		depName, ok := d.(string)
+		if !ok { continue }
+		if _, err := os.Stat(filepath.Join(root, "source", "modules", depName, "module.json")); os.IsNotExist(err) {
+			r.Valid = false; r.Errors = append(r.Errors, "Dependency '"+depName+"' not found")
+		}
+	}
+
+	importResult := checkImports(root, modName)
+	if !importResult["ok"].(bool) { r.Valid = false; r.Errors = append(r.Errors, fmt.Sprintf("Import mismatch: %s", importResult["error"])) }
+	r.Imports = importResult
+
+	// ── Comprehensive Import Scan (v5.4.0) ──
+	langScan := lang
+	if langScan == "" { langScan = "python" }
+	scanResult := check.ScanImports(root, modName, langScan, implData)
+	// Add warnings for local (non-module) imports that could be adopted
+	for _, loc := range scanResult.Local {
+		r.Warnings = append(r.Warnings, fmt.Sprintf("Local import %q — consider module_adopt(\"%s\") to bring under yanxi management", loc.Raw, loc.Package))
+	}
+	// Track unknown imports as warnings
+	for _, unk := range scanResult.Unknown {
+		r.Warnings = append(r.Warnings, fmt.Sprintf("Unknown import %q — may need manual review", unk.Raw))
+	}
+	// Embed full scan in structured result (already JSON-safe via ImportScanResult type)
+	if scanResult != nil {
+		r.ImportScan = scanResult
+	}
+
+	// ── Cross-Module Checks (v5.4.0) ──
+
+	// 1. Calls: every declared call target must exist (upstream check)
+	r.CallIssues = checkModuleCalls(root, modName, contract)
+
+	// 2. Middleware: every declared middleware function must exist as an entry in target module
+	r.MiddlewareIssues = checkMiddlewareTargets(root, modName, contract)
+
+	// 3. Deprecated dependencies: warn if any upstream module is deprecated
+	r.DeprecatedDeps = checkDeprecatedDeps(root, modName, contract)
+
+	// ── Schema Diff (v5.3.0) ──
+	breakingChanges := CompareModuleSchemas(root, modName, contract)
+	if len(breakingChanges) > 0 {
+		r.BreakingChanges = breakingChanges
+		hasBreaking := false
+		for _, bc := range breakingChanges {
+			for _, ch := range bc.Changes {
+				if !ch.Compatible {
+					hasBreaking = true
+					break
+				}
+			}
+		}
+		if hasBreaking {
+			r.Errors = append(r.Errors, "Breaking schema changes detected — see breaking_changes")
+			r.Valid = false
+		}
+	}
+	saveSchemaCache(root, modName, contract)
+
+	// ── Downstream Compatibility (v5.4.0) ──
+	// When schema changed, check if dependent modules' calls still target valid entries
+	if len(r.BreakingChanges) > 0 {
+		downstreamIssues := checkDownstreamCompatibility(root, modName, contract)
+		if len(downstreamIssues) > 0 {
+			r.Warnings = append(r.Warnings, "Downstream compatibility: "+strings.Join(downstreamIssues, "; "))
+		}
+	}
+
+	// ── Side Effects Detection (v5.3.0) ──
+	if constraints, ok := contract["constraints"].(map[string]interface{}); ok {
+		if noSideEffects, _ := constraints["side_effects"].(bool); !noSideEffects {
+			// side_effects is false or missing — check for them
+			ok, patterns := detectSideEffects(src, lang)
+			r.SideEffects = &SideEffectResult{OK: ok, Patterns: patterns}
+			if !ok {
+				r.Warnings = append(r.Warnings, fmt.Sprintf("Side effects detected: %v. If intentional, set constraints.side_effects=true", patterns))
+			}
+		}
+	}
+
+	// ── Performance constraints (v5.3.0) ──
+	maxLatencyMs := float64(0)
+	if constraints, ok := contract["constraints"].(map[string]interface{}); ok {
+		if ml, _ := constraints["max_latency_ms"].(float64); ml > 0 { maxLatencyMs = ml }
+		// max_memory_mb parsed but measurement not yet implemented
+		_ = constraints["max_memory_mb"]
+	}
+
+	// ── Strict mode check (v5.3.0) ──
+	hasStrict := false
+	for _, entry := range entryList {
+		if entriesRaw, hasE := ifaceRaw["entries"].(map[string]interface{}); hasE {
+			if entryDef, ok := entriesRaw[entry].(map[string]interface{}); ok {
+				if strict, _ := entryDef["strict"].(bool); strict {
+					hasStrict = true
+					break
+				}
+			}
+		}
+	}
+	if hasStrict {
+		r.StrictMode = true
+	}
+
+	// ── Streaming detection (v5.3.0) ──
+	for _, entry := range entryList {
+		if entriesRaw, hasE := ifaceRaw["entries"].(map[string]interface{}); hasE {
+			if entryDef, ok := entriesRaw[entry].(map[string]interface{}); ok {
+				if streaming, _ := entryDef["streaming"].(bool); streaming {
+					r.StreamingEntries = append(r.StreamingEntries, entry)
+					// Check for yield/generator pattern in source
+					yieldRe := regexp.MustCompile(`(yield|yield from|generator|async\s+function\s*\*|function\s*\*|\bgen\b|\bstream\b)`)
+					if !yieldRe.MatchString(src) {
+						r.Warnings = append(r.Warnings, fmt.Sprintf("Entry '%s' declared streaming but no yield/generator found", entry))
+					}
+				}
+			}
+		}
+	}
+
+	// Run tests for each entry
+	for _, entry := range entryList {
+		var inputSchema, outputSchema map[string]interface{}
+		if entriesRaw, hasE := ifaceRaw["entries"].(map[string]interface{}); hasE {
+			if entryDef, ok := entriesRaw[entry].(map[string]interface{}); ok {
+				inputSchema, _ = entryDef["input_schema"].(map[string]interface{})
+				outputSchema, _ = entryDef["output_schema"].(map[string]interface{})
+			}
+		} else {
+			inputSchema, _ = ifaceRaw["input_schema"].(map[string]interface{})
+			outputSchema, _ = ifaceRaw["output_schema"].(map[string]interface{})
+		}
+		if inputSchema == nil || outputSchema == nil {
+			r.Warnings = append(r.Warnings, "No schema for entry '"+entry+"'")
+			continue
+		}
+		// Check per-entry strict mode
+		entryStrict := false
+		if entriesRaw, hasE := ifaceRaw["entries"].(map[string]interface{}); hasE {
+			if entryDef, ok := entriesRaw[entry].(map[string]interface{}); ok {
+				if strict, _ := entryDef["strict"].(bool); strict {
+					entryStrict = true
+				}
+			}
+		}
+
+		for _, tc := range generateTestCases(inputSchema, outputSchema, entry) {
+			var tr TestResult
+			var latencyMs float64
+			switch lang {
+			case "python":
+				tr, latencyMs = measureTestTime(func() TestResult {
+					return runPyTest(root, modName, entry, tc.Input, tc.Expected)
+				})
+			case "typescript", "javascript":
+				tr, latencyMs = measureTestTime(func() TestResult {
+					return runTSTest(root, modName, entry, tc.Input, tc.Expected, lang)
+				})
+			case "go":
+				tr, latencyMs = measureTestTime(func() TestResult {
+					return runGoTest(root, modName, entry, tc.Input, tc.Expected)
+				})
+			default: continue
+			}
+			// Latency benchmark check
+			if maxLatencyMs > 0 && tr.Passed && latencyMs > maxLatencyMs {
+				tr.Passed = false
+				tr.Error = fmt.Sprintf("latency %.1fms exceeds max %.0fms", latencyMs, maxLatencyMs)
+				r.Warnings = append(r.Warnings, fmt.Sprintf("Entry '%s': latency %.1fms > %.0fms max", entry, latencyMs, maxLatencyMs))
+			}
+			// Benchmark tracking
+			if tr.Passed {
+				r.Benchmarks = append(r.Benchmarks, PerformanceResult{
+					OK: latencyMs <= maxLatencyMs || maxLatencyMs == 0,
+					LatencyMs: latencyMs,
+					MaxAllowed: maxLatencyMs,
+				})
+			}
+			// Strict mode: validate input before test
+			if entryStrict && tr.Passed && len(tc.Input) > 0 {
+				if inErrs := ValidateStrict(inputSchema, tc.Input, entry+".input"); len(inErrs) > 0 {
+					tr.Passed = false
+					tr.Error = "strict input: " + strings.Join(inErrs, "; ")
+				}
+			}
+			// Strict mode: validate output against output_schema
+			if entryStrict && tr.Passed && tr.Actual != "" {
+				var actualMap map[string]interface{}
+				if json.Unmarshal([]byte(tr.Actual), &actualMap) == nil {
+					if resultVal, ok := actualMap["result"]; ok {
+						if resultMap, ok := resultVal.(map[string]interface{}); ok {
+							if outErrs := ValidateStrict(outputSchema, resultMap, entry+".output"); len(outErrs) > 0 {
+								tr.Passed = false
+								tr.Error = "strict output: " + strings.Join(outErrs, "; ")
+							}
+						}
+					}
+				}
+			}
+			r.Tests = append(r.Tests, tr)
+			if !tr.Passed { r.Valid = false }
+		}
+
+		// Coverage report per entry
+		if inputSchema != nil && len(r.Tests) > 0 {
+			testedCount := 0
+			for _, t := range r.Tests { if t.Passed { testedCount++ } }
+			cov := computeCoverage(inputSchema, len(r.Tests))
+			cov.Tested = testedCount
+			r.Coverage = &cov
+		}
+	}
+	// Run teardown (always, even after failures)
+	if lcTeardown != "" {
+		tr := runLifecycleTest(root, modName, lcTeardown, lang)
+		r.Lifecycle.Teardown = &tr
+		if !tr.Passed { r.Valid = false; r.Errors = append(r.Errors, "teardown failed: "+tr.Error) }
+	}
+	// Run health check
+	if lcHealth != "" {
+		tr := runLifecycleTest(root, modName, lcHealth, lang)
+		r.Lifecycle.Health = &tr
+		if !tr.Passed { r.Warnings = append(r.Warnings, "health check failed: "+tr.Error) }
+	}
+
+	// Cross-module issues → warnings and invalid
+	if len(r.CallIssues) > 0 {
+		r.Warnings = append(r.Warnings, "Call issues: "+strings.Join(r.CallIssues, "; "))
+	}
+	if len(r.MiddlewareIssues) > 0 {
+		r.Warnings = append(r.Warnings, "Middleware issues: "+strings.Join(r.MiddlewareIssues, "; "))
+	}
+	if len(r.DeprecatedDeps) > 0 {
+		r.Warnings = append(r.Warnings, "Deprecated dependencies: "+strings.Join(r.DeprecatedDeps, "; "))
+	}
+
+	return r
+}
+
+func checkModuleCalls(root, modName string, contract map[string]interface{}) []string {
+	ifaceRaw, _ := contract["interface"].(map[string]interface{})
+	if ifaceRaw == nil { return nil }
+	callsRaw, ok := ifaceRaw["calls"].(map[string]interface{})
+	if !ok || len(callsRaw) == 0 { return nil }
+
+	var issues []string
+	for targetModule, entriesRaw := range callsRaw {
+		entries, ok := entriesRaw.(map[string]interface{})
+		if !ok { continue }
+		// Check target module exists
+		targetJSON := filepath.Join(root, "source", "modules", targetModule, "module.json")
+		targetData, err := os.ReadFile(targetJSON)
+		if err != nil {
+			issues = append(issues, fmt.Sprintf("call target module %q does not exist", targetModule))
+			continue
+		}
+		var targetContract map[string]interface{}
+		if json.Unmarshal(targetData, &targetContract) != nil { continue }
+
+		// Build target entry set
+		targetEntries := map[string]bool{}
+		if tIface, _ := targetContract["interface"].(map[string]interface{}); tIface != nil {
+			if ents, hasE := tIface["entries"].(map[string]interface{}); hasE {
+				for k := range ents { targetEntries[k] = true }
+			} else if entry, _ := tIface["entry"].(string); entry != "" {
+				targetEntries[entry] = true
+			} else {
+				targetEntries["handler"] = true
+			}
+		}
+		for entryName := range entries {
+			if !targetEntries[entryName] {
+				issues = append(issues, fmt.Sprintf("call %s.%s: entry not found in target module", targetModule, entryName))
+			}
+		}
+	}
+	return issues
+}
+
+func checkMiddlewareTargets(root, modName string, contract map[string]interface{}) []string {
+	ifaceRaw, _ := contract["interface"].(map[string]interface{})
+	if ifaceRaw == nil { return nil }
+	mwRaw, ok := ifaceRaw["middleware"].(map[string]interface{})
+	if !ok { return nil }
+
+	var issues []string
+	for _, dir := range []string{"before", "after"} {
+		listRaw, ok := mwRaw[dir].([]interface{})
+		if !ok { continue }
+		for _, item := range listRaw {
+			ref, _ := item.(string)
+			if ref == "" { continue }
+			parts := strings.SplitN(ref, ".", 2)
+			if len(parts) != 2 {
+				issues = append(issues, fmt.Sprintf("invalid middleware ref %q (expected module.entry)", ref))
+				continue
+			}
+			tgtModule, tgtEntry := parts[0], parts[1]
+			targetJSON := filepath.Join(root, "source", "modules", tgtModule, "module.json")
+			targetData, err := os.ReadFile(targetJSON)
+			if err != nil {
+				issues = append(issues, fmt.Sprintf("middleware target module %q does not exist", tgtModule))
+				continue
+			}
+			var tgtContract map[string]interface{}
+			if json.Unmarshal(targetData, &tgtContract) != nil { continue }
+			found := false
+			if tIface, _ := tgtContract["interface"].(map[string]interface{}); tIface != nil {
+				if ents, hasE := tIface["entries"].(map[string]interface{}); hasE {
+					_, found = ents[tgtEntry]
+				} else {
+					e, _ := tIface["entry"].(string)
+					found = (e == tgtEntry) || (e == "" && tgtEntry == "handler")
+				}
+			}
+			if !found {
+				issues = append(issues, fmt.Sprintf("middleware %s.%s: entry not found in target module", tgtModule, tgtEntry))
+			}
+		}
+	}
+	return issues
+}
+
+func checkDeprecatedDeps(root, modName string, contract map[string]interface{}) []string {
+	depsRaw, _ := contract["dependencies"].([]interface{})
+	if len(depsRaw) == 0 { return nil }
+	var deprecated []string
+	for _, d := range depsRaw {
+		depName, ok := d.(string)
+		if !ok { continue }
+		targetJSON := filepath.Join(root, "source", "modules", depName, "module.json")
+		targetData, err := os.ReadFile(targetJSON)
+		if err != nil { continue }
+		var tgtContract map[string]interface{}
+		if json.Unmarshal(targetData, &tgtContract) != nil { continue }
+		if status, _ := tgtContract["status"].(string); status == "deprecated" || status == "archived" {
+			deprecated = append(deprecated, fmt.Sprintf("%s (status: %s)", depName, status))
+		}
+	}
+	return deprecated
+}
+
+func checkDownstreamCompatibility(root, changedModule string, contract map[string]interface{}) []string {
+	// Build current module's entry set (new interface)
+	ifaceRaw, _ := contract["interface"].(map[string]interface{})
+	if ifaceRaw == nil { return nil }
+	newEntries := map[string]bool{}
+	if ents, hasE := ifaceRaw["entries"].(map[string]interface{}); hasE {
+		for k := range ents { newEntries[k] = true }
+	} else if entry, _ := ifaceRaw["entry"].(string); entry != "" {
+		newEntries[entry] = true
+	} else {
+		newEntries["handler"] = true
+	}
+
+	// Scan all modules for calls targeting this module
+	var issues []string
+	modDir := filepath.Join(root, "source", "modules")
+	dirs, err := os.ReadDir(modDir)
+	if err != nil { return nil }
+	for _, d := range dirs {
+		if !d.IsDir() || d.Name() == changedModule { continue }
+		otherJSON := filepath.Join(modDir, d.Name(), "module.json")
+		data, err := os.ReadFile(otherJSON)
+		if err != nil { continue }
+		var other map[string]interface{}
+		if json.Unmarshal(data, &other) != nil { continue }
+		otherIface, _ := other["interface"].(map[string]interface{})
+		if otherIface == nil { continue }
+		callsRaw, _ := otherIface["calls"].(map[string]interface{})
+		if callsRaw == nil { continue }
+		for tgtMod, entriesRaw := range callsRaw {
+			if tgtMod != changedModule { continue }
+			entries, _ := entriesRaw.(map[string]interface{})
+			for entryName := range entries {
+				if !newEntries[entryName] {
+					issues = append(issues, fmt.Sprintf("%s calls %s.%s which no longer exists", d.Name(), changedModule, entryName))
+				}
+			}
+		}
+	}
+	return issues
+}
+
+func checkImports(root, modName string) map[string]interface{} {
+	modJSONPath := filepath.Join(root, "source", "modules", modName, "module.json")
+	data, _ := os.ReadFile(modJSONPath)
+	var contract map[string]interface{}
+	json.Unmarshal(data, &contract)
+	depsRaw, _ := contract["dependencies"].([]interface{})
+	declared := map[string]bool{}
+	var declList []string
+	for _, d := range depsRaw { if s, ok := d.(string); ok { declared[s] = true; declList = append(declList, s) } }
+	lang, _ := contract["language"].(string)
+	if lang == "" { lang = "python" }
+	extMap := map[string]string{"python": "py", "typescript": "ts", "javascript": "js", "go": "go"}
+	ext := extMap[lang]
+	if ext == "" { ext = "py" }
+	src, err := os.ReadFile(filepath.Join(root, "source", "modules", modName, modName+"."+ext))
+	if err != nil { return map[string]interface{}{"ok": false, "error": "cannot read impl"} }
+	importRe := regexp.MustCompile(`from\s+source\.modules\.(\w+)\.\w+\s+import\s+\w+`)
+	impSet := map[string]bool{}
+	var impList []string
+	for _, m := range importRe.FindAllStringSubmatch(string(src), -1) {
+		if len(m) > 1 && m[1] != modName && !impSet[m[1]] { impSet[m[1]] = true; impList = append(impList, m[1]) }
+	}
+	var undecl, unused []string
+	for _, imp := range impList { if !declared[imp] { undecl = append(undecl, imp) } }
+	for _, dec := range declList { if !impSet[dec] { unused = append(unused, dec) } }
+	ok := len(undecl) == 0 && len(unused) == 0
+	errMsg := ""
+	if len(undecl) > 0 { errMsg = fmt.Sprintf("undeclared: %v", undecl) }
+	if len(unused) > 0 { if errMsg != "" { errMsg += "; " }; errMsg += fmt.Sprintf("unused: %v", unused) }
+	return map[string]interface{}{"ok": ok, "declared": declList, "imported": impList, "undeclared": undecl, "unused": unused, "error": errMsg}
+}
+
+func generateTestCases(inSchema, outSchema map[string]interface{}, fname string) []TestResult {
+	propsRaw, ok := inSchema["properties"].(map[string]interface{})
+	if !ok { return nil }
+	required := map[string]bool{}
+	if reqList, ok := inSchema["required"].([]interface{}); ok {
+		for _, r := range reqList { if s, ok := r.(string); ok { required[s] = true } }
+	}
+	var tests []TestResult
+	input := make(map[string]interface{})
+	for key, propRaw := range propsRaw {
+		prop, _ := propRaw.(map[string]interface{})
+		if enumVals, ok := prop["enum"].([]interface{}); ok && len(enumVals) > 0 {
+			input[key] = enumVals[0]
+		} else {
+			switch prop["type"].(string) {
+			case "string": input[key] = "test"
+			case "number": input[key] = 42.0
+			case "integer": input[key] = 42
+			case "boolean": input[key] = true
+			default: input[key] = "test"
+			}
+		}
+	}
+	if len(input) > 0 { tests = append(tests, TestResult{Input: input, Expected: detExp(outSchema)}) }
+	for key, propRaw := range propsRaw {
+		prop, _ := propRaw.(map[string]interface{})
+		if enumVals, ok := prop["enum"].([]interface{}); ok && len(enumVals) > 1 {
+			for _, val := range enumVals {
+				tc := make(map[string]interface{})
+				for k, v := range input { tc[k] = v }
+				tc[key] = val
+				tests = append(tests, TestResult{Input: tc, Expected: detExp(outSchema)})
+			}
+			inv := make(map[string]interface{})
+			for k, v := range input { inv[k] = v }
+			inv[key] = "INVALID"
+			tests = append(tests, TestResult{Input: inv, Expected: "error"})
+		}
+	}
+	for key := range required {
+		mtc := make(map[string]interface{})
+		for k, v := range input { mtc[k] = v }
+		delete(mtc, key)
+		tests = append(tests, TestResult{Input: mtc, Expected: "error"})
+	}
+	if len(required) == 0 { tests = append(tests, TestResult{Input: map[string]interface{}{}, Expected: detExp(outSchema)}) }
+	return tests
+}
+
+func detExp(outSchema map[string]interface{}) string {
+	props, _ := outSchema["properties"].(map[string]interface{})
+	if props == nil { return "non-null object" }
+	parts := []string{}
+	for name, prop := range props {
+		p, _ := prop.(map[string]interface{})
+		parts = append(parts, fmt.Sprintf("%s: %s", name, p["type"]))
+	}
+	return fmt.Sprintf("{%s}", strings.Join(parts, ", "))
+}
+
+// ── Multi-language test execution ──
+
+// runLifecycleTest runs a lifecycle function (setup/teardown/health) with no input.
+func runLifecycleTest(root, modName, fname, lang string) TestResult {
+	tr := TestResult{Input: map[string]interface{}{}, Expected: "ok"}
+	var script string
+	switch lang {
+	case "python":
+		script = fmt.Sprintf(`
+import sys, json
+sys.path.insert(0, %q)
+sys.path.insert(0, %q)
+import %s
+r = %s.%s()
+print(json.dumps(r))
+`, filepath.Join(root, "source", "modules", modName), root, modName, modName, fname)
+		return runCmd("python", []string{"-c", script}, tr)
+	case "typescript", "javascript":
+		script = fmt.Sprintf(`const {%s} = require("%s/source/modules/%s/%s");
+console.log(JSON.stringify(%s()));
+`, fname, filepath.ToSlash(root), modName, modName, fname)
+		rt := "node"
+		if lang == "typescript" { rt = "npx"; script = "require('ts-node/register');" + script }
+		return runCmd(rt, []string{"-e", script}, tr)
+	case "go":
+		script = fmt.Sprintf(`package main
+import ("encoding/json";"fmt";_ "%s/source/modules/%s")
+func main() {
+    r := %s.%s()
+    b, _ := json.Marshal(r)
+    fmt.Println(string(b))
+}
+`, root, modName, modName, fname)
+		tmpFile := filepath.Join(os.TempDir(), "yanxi-lc-"+modName+"-"+fname+".go")
+		os.WriteFile(tmpFile, []byte(script), 0644)
+		defer os.Remove(tmpFile)
+		return runCmd("go", []string{"run", tmpFile}, tr)
+	default:
+		tr.Passed = true; tr.Note = "no runtime for " + lang
+		return tr
+	}
+}
+
+func runPyTest(root, modName, fname string, input map[string]interface{}, expected string) TestResult {
+	tr := TestResult{Input: input, Expected: expected}
+	inputJSON, _ := json.Marshal(input)
+	script := fmt.Sprintf(`
+import sys, json
+sys.path.insert(0, %q)
+sys.path.insert(0, %q)
+import %s
+r = %s.%s(json.loads(%q))
+print(json.dumps(r))
+`, filepath.Join(root, "source", "modules", modName), root, modName, modName, fname, string(inputJSON))
+	return runCmd("python", []string{"-c", script}, tr)
+}
+
+func runTSTest(root, modName, fname string, input map[string]interface{}, expected, lang string) TestResult {
+	tr := TestResult{Input: input, Expected: expected}
+	inputJSON, _ := json.Marshal(input)
+	script := fmt.Sprintf(`const {%s} = require("%s/source/modules/%s/%s");
+console.log(JSON.stringify(%s(%s)));
+`, fname, filepath.ToSlash(root), modName, modName, fname, string(inputJSON))
+	runtime := "node"
+	if lang == "typescript" { runtime = "npx"; script = "require('ts-node/register');" + script }
+	return runCmd(runtime, []string{"-e", script}, tr)
+}
+
+func runGoTest(root, modName, fname string, input map[string]interface{}, expected string) TestResult {
+	tr := TestResult{Input: input, Expected: expected}
+	inputJSON, _ := json.Marshal(input)
+	script := fmt.Sprintf(`package main
+import ("encoding/json";"fmt";_ "%s/source/modules/%s")
+func main() {
+    var d map[string]interface{}
+    json.Unmarshal([]byte(%q), &d)
+    r := %s.%s(d)
+    b, _ := json.Marshal(r)
+    fmt.Println(string(b))
+}
+`, root, modName, string(inputJSON), modName, fname)
+	tmpFile := filepath.Join(os.TempDir(), "yanxi-gotest-"+modName+".go")
+	os.WriteFile(tmpFile, []byte(script), 0644)
+	defer os.Remove(tmpFile)
+	return runCmd("go", []string{"run", tmpFile}, tr)
+}
+
+func runCmd(cmd string, args []string, tr TestResult) TestResult {
+	c := exec.Command(cmd, args...)
+	out, err := c.CombinedOutput()
+	outStr := strings.TrimSpace(string(out))
+	if err != nil {
+		tr.Passed = false
+		tr.Error = fmt.Sprintf("%s: %v\n%s", cmd, err, outStr)
+		return tr
+	}
+	tr.Actual = outStr
+	var output map[string]interface{}
+	if json.Unmarshal([]byte(outStr), &output) != nil {
+		tr.Passed = false; tr.Error = "output not JSON: " + outStr
+		return tr
+	}
+	if errObj, hasErr := output["error"]; hasErr && errObj != nil {
+		if es, ok := errObj.(string); ok && es != "" { tr.Passed = false; tr.Error = "handler error: " + es; return tr }
+	}
+	if _, hr := output["result"]; !hr { tr.Note = "no 'result' field" }
+	tr.Passed = true
+	return tr
+}

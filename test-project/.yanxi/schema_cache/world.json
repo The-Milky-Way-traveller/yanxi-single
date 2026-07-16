@@ -1,0 +1,24 @@
+{
+  "interface": {
+    "description": "World module",
+    "entry": "handler",
+    "input_schema": {
+      "properties": {
+        "action": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "output_schema": {
+      "properties": {
+        "error": {
+          "type": "string"
+        },
+        "result": {}
+      },
+      "type": "object"
+    }
+  },
+  "version": "0.1.0"
+}
