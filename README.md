@@ -25,11 +25,6 @@ When an AI agent enters a project, it reads source files until it understands th
 
 Yanxi's answer: **information density over information volume.**
 
-```
-Without yanxi:   14 modules × ~2000 lines = ~28,000 tokens to understand the project
-With yanxi:      module_discover()         = ~500 tokens for the full picture
-```
-
 It does three things:
 
 1. **Give a map** — Agent enters a project, reads ~500 tokens, understands the full landscape.
@@ -65,12 +60,9 @@ Level 3 — Module Detail (~300 tokens each, on demand)
 
 ### The AIexplain Knowledge Layer
 
-Every module gets auto-generated documentation that agents read instead of source code:
+Every module gets auto-generated documentation that agents can read instead of source code:
 
 ```
-source/modules/config/config.go      → ~2000 tokens of raw Go
-AIexplain/modules/config/config.md   → ~150 tokens of structured knowledge
-
 # config Module
 **Status**: wip | **Version**: 0.1.0 | **Language**: go
 
