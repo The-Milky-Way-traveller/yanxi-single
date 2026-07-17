@@ -86,29 +86,45 @@ func EnsureAIExplain(root string) {
 				}
 			}
 
-			md := fmt.Sprintf("# %s Module\n\n## Purpose\n\n", modName)
+			md := fmt.Sprintf("# %s Module\n\n", modName)
+
+			// Status + Version header
+			modStatus := "active"
+			modVersion := "0.1.0"
+			modLang := lang
 			if modData != nil {
-				if desc, ok := modData["description"].(string); ok && desc != "" {
+				if s, _ := modData["status"].(string); s != "" { modStatus = s }
+				if v, _ := modData["version"].(string); v != "" { modVersion = v }
+				if l, _ := modData["language"].(string); l != "" { modLang = l }
+			}
+			md += fmt.Sprintf("**Status**: %s | **Version**: %s | **Language**: %s\n\n", modStatus, modVersion, modLang)
+
+			// Purpose
+			md += "## Purpose\n\n"
+			if modData != nil {
+				if desc, ok := modData["description"].(string); ok && desc != "" && !strings.Contains(desc, modName+" module") {
 					md += desc + "\n\n"
 				} else if docstring != "" {
 					md += docstring + "\n\n"
 				} else {
-					md += modName + " module — see interface for details.\n\n"
+					md += modName + " module." + "\n\n"
 				}
 			} else {
-				md += modName + " module — see interface for details.\n\n"
+				md += modName + " module." + "\n\n"
 			}
-			if docstring != "" && modData != nil {
-				if desc, ok := modData["description"].(string); !ok || desc == "" {
-					// docstring already used as purpose
-				} else {
-					md += docstring + "\n\n"
+
+			// Dependencies (what this module depends ON)
+			if modData != nil {
+				if deps, ok := modData["dependencies"].([]interface{}); ok && len(deps) > 0 {
+					var depNames []string
+					for _, d := range deps { depNames = append(depNames, fmt.Sprintf("%v", d)) }
+					md += "**Depends on**: " + strings.Join(depNames, ", ") + "\n\n"
 				}
 			}
 
-			// Dependents info
+			// Dependents (who depends on this)
 			if dependents, ok := depMap[modName]; ok && len(dependents) > 0 {
-				md += fmt.Sprintf("**Depended by**: %s\n\n", strings.Join(dependents, ", "))
+				md += "**Depended by**: " + strings.Join(dependents, ", ") + "\n\n"
 			} else {
 				md += "**Depended by**: none\n\n"
 			}
@@ -149,20 +165,37 @@ func EnsureAIExplain(root string) {
 					}
 				}
 			}
-			lang = "python"
-			if modData != nil { if l, ok := modData["language"].(string); ok && l != "" { lang = l } }
-			var example string
-			switch lang {
-			case "python":
-				example = "```python\nhandler({\"action\": \"...\", ...})\n# → {\"result\": ...}\n```"
-			case "typescript", "javascript":
-				example = "```ts\nhandler({action: \"...\", ...})\n// → {result: ...}\n```"
-			case "go":
-				example = "```go\nhandler(map[string]interface{}{\"action\": \"...\", ...})\n// → map[string]interface{}{\"result\": ...}\n```"
-			default:
-				example = "```python\nhandler({\"action\": \"...\", ...})\n# → {\"result\": ...}\n```"
+			// Usage example: show the real handler signature
+			md += "## Usage Example\n\n"
+			if modData != nil {
+				if mIface, ok := modData["interface"].(map[string]interface{}); ok {
+					if ents, hasE := mIface["entries"].(map[string]interface{}); hasE && len(ents) > 0 {
+						var firstEntry string
+						for k := range ents { firstEntry = k; break }
+						md += fmt.Sprintf("```go\n%s.%s(input)\n```\n\n", modName, firstEntry)
+					} else {
+						md += fmt.Sprintf("```\n%s(input) -> dict\n```\n\n", handlerSig)
+					}
+				}
+			} else {
+				md += fmt.Sprintf("```\n%s(input) -> dict\n```\n\n", handlerSig)
 			}
-			md += "## Usage Example\n\n" + example + "\n\n"
+
+			// Error codes
+			if modData != nil {
+				if errDecls, ok := modData["errors"].(map[string]interface{}); ok && len(errDecls) > 0 {
+					md += "## Error Codes\n\n"
+					for code, descRaw := range errDecls {
+						if desc, _ := descRaw.(string); desc != "" {
+							md += fmt.Sprintf("- `%s`: %s\n", code, desc)
+						} else {
+							md += fmt.Sprintf("- `%s`\n", code)
+						}
+					}
+					md += "\n"
+				}
+			}
+
 			md += "## Dependencies\n\n"
 			if modData != nil {
 				if deps, ok := modData["dependencies"].([]interface{}); ok && len(deps) > 0 {
