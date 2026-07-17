@@ -226,7 +226,7 @@ func ValidateModule(root, modName string) Result {
 	r.CallIssues = checkModuleCalls(root, modName, contract)
 
 	// 1b. Calls auto-infer: scan source for cross-module call patterns not yet declared
-	inferredCalls := inferModuleCalls(src, modName, lang)
+	inferredCalls := inferModuleCalls(src, modName, lang, root)
 	if len(inferredCalls) > 0 {
 		autoSyncCalls(root, modName, contract, inferredCalls)
 		r.Warnings = append(r.Warnings, fmt.Sprintf("Auto-synced %d calls from source", len(inferredCalls)))
@@ -775,6 +775,12 @@ func checkImports(root, modName string) map[string]interface{} {
 	src, err := os.ReadFile(filepath.Join(root, "source", "modules", modName, modName+"."+ext))
 	if err != nil { return map[string]interface{}{"ok": false, "error": "cannot read impl"} }
 	importRe := regexp.MustCompile(`from\s+source\.modules\.(\w+)\.\w+\s+import\s+\w+`)
+	switch lang {
+	case "go":
+		importRe = regexp.MustCompile(`"(?:\w+/)?source/modules/(\w+)(?:/\w+)?[""]`)
+	case "typescript", "javascript":
+		importRe = regexp.MustCompile(`(?:from|require)\s*\(\s*['"].*source/modules/(\w+)/\w+['"]\s*\)`)
+	}
 	impSet := map[string]bool{}
 	var impList []string
 	for _, m := range importRe.FindAllStringSubmatch(string(src), -1) {
@@ -1003,29 +1009,30 @@ func bumpVersion(contract map[string]interface{}, level string) {
 }
 
 // inferModuleCalls scans source code for cross-module call patterns.
-// Returns a list of "module.entry" strings found in source.
-func inferModuleCalls(src, currentModule, lang string) []string {
+// Only includes calls targeting known yanxi modules.
+func inferModuleCalls(src, currentModule, lang string, root string) []string {
+	// Build known module set
+	knownMods := knownModuleSet(root)
+	if len(knownMods) == 0 {
+		return nil
+	}
+
 	var calls []string
 	seen := map[string]bool{}
 
 	// Pattern: module_name.function_name()
-	// For all languages, match `module.entry(` style calls
 	re := regexp.MustCompile(`(\w+)\.(\w+)\s*\(`)
 	for _, m := range re.FindAllStringSubmatch(src, -1) {
 		if len(m) < 3 {
 			continue
 		}
 		mod, entry := m[1], m[2]
-		// Skip: self-calls, common keywords, non-module patterns
-		if mod == currentModule || mod == "self" || mod == "this" || mod == "fmt" || mod == "os" || mod == "json" || mod == "log" {
+		// Only accept if mod is a known yanxi module
+		if !knownMods[mod] {
 			continue
 		}
-		// Skip standard library / built-in names
-		if len(mod) <= 2 {
-			continue
-		}
-		// Skip methods on variables (lowercase first letter typical variable)
-		if entry == "Error" || entry == "String" || entry == "error" {
+		// Skip self-references
+		if mod == currentModule {
 			continue
 		}
 		key := mod + "." + entry
@@ -1035,6 +1042,22 @@ func inferModuleCalls(src, currentModule, lang string) []string {
 		}
 	}
 	return calls
+}
+
+// knownModuleSet returns the set of registered yanxi module names.
+func knownModuleSet(root string) map[string]bool {
+	set := map[string]bool{}
+	modDir := filepath.Join(root, "source", "modules")
+	entries, err := os.ReadDir(modDir)
+	if err != nil {
+		return set
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			set[e.Name()] = true
+		}
+	}
+	return set
 }
 
 // autoSyncCalls writes discovered calls into module.json's interface.calls.

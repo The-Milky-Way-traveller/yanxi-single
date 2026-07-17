@@ -137,7 +137,7 @@ func {{.}}(d map[string]interface{}) map[string]interface{} {
 	t.Wire.UseMapPattern = true
 	t.Validate.EntryRegex = `func\s+{{.Entry}}\s*\(`
 	t.Validate.LifecycleRegex = `(?:func|method)\s+{{.Name}}\s*\(`
-	t.Validate.ExportFuncRegex = `(?m)^(?:func|type|var|const)\s+([A-Z]\w*)`
+	t.Validate.ExportFuncRegex = `(?m)^func\s+([A-Z]\w*)`
 	t.Validate.CallExtractRegex = ``
 	t.Validate.ImportExtractRegex = `"([^"]+)"`
 	t.Validate.TestRuntime = `go run {{.File}}`
