@@ -110,6 +110,35 @@ Write what this module does, why it exists separately, and any key behaviors:
 
 `module_validate()` warns if descriptions are generic. Don't run `aiexplain_generate()` until descriptions are meaningful — the AIexplain cards are only as useful as the descriptions you write.
 
+### Always Write Test Cases
+
+`module_validate()` auto-generates basic smoke tests from schema, but it cannot verify business logic correctness. You must write custom test cases.
+
+After writing handler code, create `source/modules/<name>/test_cases.json`:
+
+```json
+{
+  "cases": [
+    {
+      "entry": "login",
+      "description": "正常登录",
+      "input": {"username": "admin", "password": "correct"},
+      "expected": {"token": "xxx"},
+      "expect_error": false
+    },
+    {
+      "entry": "login",
+      "description": "密码错误应报错",
+      "input": {"username": "admin", "password": "wrong"},
+      "expect_error": true
+    }
+  ]
+}
+```
+
+Copy the template from `project-memory/test_cases.json` to get started.
+`module_validate()` will warn if test_cases.json is missing — do not ignore this warning.
+
 ### Adding a new module
 ```
 module_create("name", language="go") → write handler → module_validate → module_wire

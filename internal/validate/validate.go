@@ -166,7 +166,16 @@ func ValidateModule(root, modName string) Result {
 			pat = langTmpl.EntryRegex(entry)
 		}
 		handlerRe := regexp.MustCompile(pat)
-		if !handlerRe.MatchString(src) { r.Valid = false; r.Errors = append(r.Errors, "Entry '"+entry+"' not found") }
+		if !handlerRe.MatchString(src) {
+			// If module declares provides interfaces, handler is optional
+			if ifaceRaw != nil {
+				if _, hasProvides := ifaceRaw["provides"].(map[string]interface{}); hasProvides && entry == "handler" {
+					continue
+				}
+			}
+			r.Valid = false
+			r.Errors = append(r.Errors, "Entry '"+entry+"' not found")
+		}
 	}
 
 	// ── Entry Auto-Sync (v1.0.0) ──
@@ -385,6 +394,47 @@ func ValidateModule(root, modName string) Result {
 		if inputSchema == nil || outputSchema == nil {
 			r.Warnings = append(r.Warnings, "No schema for entry '"+entry+"'")
 			continue
+		}
+
+		// Check for custom test cases
+		testCasesPath := filepath.Join(root, "source", "modules", modName, "test_cases.json")
+		if _, tcErr := os.Stat(testCasesPath); tcErr != nil {
+			r.Warnings = append(r.Warnings, fmt.Sprintf("No custom test cases (test_cases.json) for entry '%s' — LLM should write test cases to validate business logic", entry))
+		} else {
+			tcData, _ := os.ReadFile(testCasesPath)
+			var tcDef struct {
+				Cases []struct {
+					Entry       string                 `json:"entry"`
+					Input       map[string]interface{} `json:"input"`
+					Expected    map[string]interface{} `json:"expected,omitempty"`
+					ExpectError bool                   `json:"expect_error,omitempty"`
+				} `json:"cases"`
+			}
+			if json.Unmarshal(tcData, &tcDef) == nil {
+				for _, tc := range tcDef.Cases {
+					if tc.Entry != entry {
+						continue
+					}
+					// Run custom test
+					var tr TestResult
+					switch lang {
+					case "python":
+						tr = runPyTest(root, modName, entry, tc.Input, fmt.Sprintf("%v", tc.Expected))
+					case "go":
+						tr = runGoTest(root, modName, entry, tc.Input, fmt.Sprintf("%v", tc.Expected))
+					case "typescript", "javascript":
+						tr = runTSTest(root, modName, entry, tc.Input, fmt.Sprintf("%v", tc.Expected), lang)
+					}
+					if tc.ExpectError && tr.Passed {
+						tr.Passed = false
+						tr.Error = "expected error but got success"
+					}
+					r.Tests = append(r.Tests, tr)
+					if !tr.Passed {
+						r.Valid = false
+					}
+				}
+			}
 		}
 		// Check per-entry strict mode
 		entryStrict := false

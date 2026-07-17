@@ -369,6 +369,32 @@ func InitProjectMemory(root string) map[string]bool {
 		result["conventions.json"] = true
 	}
 
+	// test_cases.json template
+	tcJSON := filepath.Join(root, "project-memory", "test_cases.json")
+	if _, err := os.Stat(tcJSON); os.IsNotExist(err) {
+		tmpl := `{
+  "description": "Copy this file to source/modules/<name>/test_cases.json and fill in test cases",
+  "cases": [
+    {
+      "entry": "handler",
+      "description": "正常调用",
+      "input": {"action": "test"},
+      "expected": {"result": "ok"},
+      "expect_error": false
+    },
+    {
+      "entry": "handler",
+      "description": "错误输入",
+      "input": {"action": ""},
+      "expect_error": true
+    }
+  ]
+}
+`
+		os.WriteFile(tcJSON, []byte(tmpl), 0644)
+		result["test_cases.json"] = true
+	}
+
 	// Check which files were created
 	for _, name := range []string{"architecture-decisions.md", "lessons-learned.md", "conventions.md"} {
 		path := filepath.Join(root, "project-memory", name)

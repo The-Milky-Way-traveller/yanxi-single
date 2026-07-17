@@ -129,6 +129,30 @@ func EnsureAIExplain(root string) {
 				md += "**Depended by**: none\n\n"
 			}
 
+			// Provides interfaces (v1.1.0)
+			if modData != nil {
+				if iface, ok := modData["interface"].(map[string]interface{}); ok {
+					if provides, ok := iface["provides"].(map[string]interface{}); ok && len(provides) > 0 {
+						md += "## Provides\n\n"
+						for ifaceName, ifaceDef := range provides {
+							if def, ok := ifaceDef.(map[string]interface{}); ok {
+								if desc, _ := def["description"].(string); desc != "" {
+									md += fmt.Sprintf("### `%s`\n%s\n\n", ifaceName, desc)
+								} else {
+									md += fmt.Sprintf("### `%s`\n\n", ifaceName)
+								}
+								if methods, ok := def["methods"].([]interface{}); ok && len(methods) > 0 {
+									for _, m := range methods {
+										md += fmt.Sprintf("- `%v`\n", m)
+									}
+									md += "\n"
+								}
+							}
+						}
+					}
+				}
+			}
+
 			md += fmt.Sprintf("## Interface\n\n`%s`\n\n", handlerSig)
 			if modData != nil {
 				if iface, ok := modData["interface"].(map[string]interface{}); ok {

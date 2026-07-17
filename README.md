@@ -1,139 +1,205 @@
 # Yanxi — Agent-First Micro-Module Architecture
 
-**A 6 MB, zero-dependency MCP server that teaches AI agents how to navigate and evolve structured codebases.**
+**A 6 MB, zero-dependency MCP server that structures codebases for AI agents.**
 
-Yanxi doesn't run pipelines. It doesn't manage agents. It doesn't generate your business logic.
+Yanxi doesn't run pipelines. It doesn't manage agents. It doesn't generate business logic.
 
 It does three things:
 
-1. **Give a map** — Agent enters a project, reads ~500 tokens, understands the full landscape. No need to read every source file.
-2. **Catch mistakes** — Agent writes code, gets instant feedback: handler missing? import wrong? interface broken? schema changed? downstream modules affected?
-3. **Remember experience** — Agent makes a mistake, yanxi writes it to `lessons-learned.md`. Next agent never repeats it.
+1. **Give a map** — Agent enters a project, reads ~500 tokens, understands the full landscape.
+2. **Catch mistakes** — Agent writes code, gets instant feedback across 6 validation stages.
+3. **Remember experience** — Agent makes a mistake, yanxi writes it to lessons-learned. Next agent never repeats it.
 
 ```
 Agent's job:         decide, design, implement, deploy
-Yanxi's job:         structure, validate, wire, document, remember
+Yanxi's job:         structure, validate, wire, document, remember, test
 ```
 
 ### What makes yanxi different
 
-Yanxi's answer to the question "how do agents keep working at scale?" rests on two mechanisms that work together:
+Yanxi's answer to "how do agents keep working at scale?" rests on two mechanisms:
 
-**Micro-module contracts.** Every module comes with a machine-readable `module.json` — not just a name and description, but typed entry schemas, cross-module call declarations, middleware references, dependencies, and error codes. The contract isn't documentation for a human to read; it's data for yanxi to validate, diff, and reason about. This is what makes the second mechanism possible.
+**Micro-module contracts.** Every module has a machine-readable `module.json` — typed entry schemas, cross-module call declarations, interface provides/uses, dependencies, middleware references, and error codes. The contract isn't documentation for a human to read; it's data for yanxi to validate, diff, and reason about.
 
-**Push-based contract verification.** When an agent runs `module_validate("auth")`, yanxi walks a 6-stage pipeline: structural integrity → source-level checks → cross-module contract checks (calls, middleware, deprecation, downstream compatibility) → deep analysis → runtime tests → schema diff. Every issue is surfaced to the agent automatically — broken call references, schema incompatibilities, middleware functions that don't exist, upstream modules that have been deprecated, downstream modules whose calls no longer match. The agent doesn't need to know what to ask; yanxi pushes the answers.
+**Push-based contract verification.** When an agent runs `module_validate("auth")`, yanxi walks a 6-stage pipeline automatically. Every issue is surfaced to the agent — broken call references, schema incompatibilities, middleware functions that don't exist, upstream modules that have been deprecated, downstream modules whose calls no longer match. The agent doesn't need to know what to ask; yanxi pushes the answers.
 
-These two mechanisms form a closed loop: contracts enable validation, validation protects contracts, and both run without the agent needing to search for what might be wrong.
+These two form a closed loop: contracts enable validation, validation protects contracts.
 
 ---
 
 ## Contents
 
-- [The Problem: Context Cliff](#the-problem-context-cliff)
-- [Agent-First Design](#agent-first-design)
-- [Three Information Layers](#three-information-layers)
+- [The Information Architecture](#the-information-architecture)
+- [18 MCP Tools](#18-mcp-tools)
+- [Agent Workflow](#agent-workflow)
 - [The Module Contract](#the-module-contract)
-- [18 MCP Tools — Complete Reference](#18-mcp-tools--complete-reference)
-- [The Validation Pipeline (6 Stages)](#the-validation-pipeline-6-stages)
-- [Module Lifecycle](#module-lifecycle)
-- [Project Structure](#project-structure)
-- [What Yanxi Does NOT Do](#what-yanxi-explicitly-does-not-do)
+- [Validation Pipeline (6 Stages)](#validation-pipeline-6-stages)
+- [Yanxi vs Agent Boundary](#yanxi-vs-agent-boundary)
+- [What Yanxi Does NOT Do](#what-yanxi-does-not-do)
 - [Build & Run](#build--run)
-- [License](#license)
 
 ---
 
-## The Problem: Context Cliff
+## The Information Architecture
 
-An AI agent has ~128K tokens of context. Reading 5-10 modules' source code fills it entirely. The agent starts making decisions with an incomplete picture — that's the **Context Cliff**.
-
-Traditional approach:
-
-```
-n modules × k source lines = O(n·k) tokens to understand a project
-n=50 modules: ~100,000 tokens (window full, detail lost)
-```
-
-Yanxi's approach:
-
-```
-n × 20 (summary) + T (on-demand detail) = O(20n + T) tokens
-n=50 modules: ~1,200 tokens + 500/module on demand
-```
-
-The difference is **information density over information volume**. Every token must carry maximum decision value.
-
----
-
-## Agent-First Design
-
-Everything in yanxi is designed for how AI agents read code, not how humans do.
-
-| Human habit | What agents need | Yanxi's answer |
-|---|---|---|
-| "The class name is self-documenting" | Explicit input/output schemas | `module.json` with JSON Schema per entry |
-| "Look at the caller to understand usage" | Cross-module call graph | `calls` declarations + `module_discover` call graph |
-| "I remember past bugs" | Persistent memory across sessions | `project-memory/` with ADRs + lessons + conventions |
-| "This module touches a few files" | Dependency graph + impact analysis | `module_validate` schema diff + downstream notification |
-
-### The Yanxi-Agent Boundary
-
-```
-Agent's task                        Who owns it
-─────────────────────────────────────────────────────────────
-Analyse requirements                Agent (LLM)
-Design module decomposition         Agent (with yanxi's module.json template)
-Write handler code                  Agent
-Create module.json skeleton         Yanxi (module_create)
-Register module in routing table    Yanxi (module_wire)
-Validate everything was done right  Yanxi (module_validate — 6 stages)
-Detect breaking interface changes   Yanxi (schema diff)
-Record design decisions             Yanxi (memory_write / WriteADR)
-Tell next agent about pitfalls      Yanxi (lessons-learned.md, auto-written on failure)
-Start HTTP server                   Agent (LLM generates FastAPI/Gin in 5 seconds)
-Write test cases                    Agent (LLM knows edge cases)
-Deploy                              Agent (LLM writes Dockerfile)
-```
-
-**The rule**: mechanical, repetitive, forgettable tasks → yanxi automates. Tasks requiring domain knowledge, design decisions, or that vary per project → agent owns.
-
----
-
-## Three Information Layers
-
-An agent enters a project and gets **Level 1 + Level 2** in a single `module_discover()` call (~500 tokens). It then drills into **Level 3** only for modules it needs to touch.
+Yanxi organizes project knowledge into three layers. An agent reads ~500 tokens total to understand the full project, then drills into details only for modules it needs to touch.
 
 ```
 Level 1 — Project Panorama (~200 tokens)
-  "yanxi-desktop: AI chat desktop app. Go + Chi + SQLite.
-   Architecture: agent → provider × tools → api(HTTP)
-   Status: Core features done. 16 modules. Start: agent, provider."
+  module_discover()
+  → Project summary: language, module count, build order, warnings
+  → Project memory: ADRs, lessons learned, conventions
+  → Deprecation warnings: ⚠ marked modules, circular deps
 
 Level 2 — Module Digest (~300 tokens)
-  agent   → orchestrator (dep: provider, tools, session)  ✓ validated
-  api     → HTTP server  (dep: agent, session, config)     ✓ validated
-  auth    → JWT login    (dep: storage)                    ✗ has warnings
-  config  → config loader (dep: none)                      ✓ validated
-  ...
+  module_discover() → module list
+  → Each module: name, version, status, language, entry count, dependents
+  → Agent decides which module to work on
 
-Level 3 — Module Detail (~500 tokens each, on demand)
+Level 3 — Module Detail (~300 tokens each, on demand)
   module_read("auth")
-    → full contract (module.json)
-    → AIexplain card (what it does + how to use)
-    → interface.md (entry points + schemas)
-    → source preview (first 2000 chars)
+  → AIexplain card: purpose, interfaces, entries, usage, errors
+  → interface.md: entry points with schemas
+  → Source preview: first 2000 characters
+```
+
+### The AIexplain Layer (Level 3 Core)
+
+AIexplain is the knowledge layer. Every module gets auto-generated documentation that agents read instead of source code:
+
+```
+source/modules/config/config.go      → ~2000 tokens of raw Go code
+AIexplain/modules/config/config.md   → ~150 tokens of structured knowledge
+
+AIexplain card for config module:
+
+  # config Module
+  **Status**: wip | **Version**: 0.1.0 | **Language**: go
+
+  ## Purpose
+  Package config manages application configuration from various sources.
+  **Depended by**: agent, api, mcpclient, permission, tools
+
+  ## Interface
+  func Get() *Config {
+
+  ### Entries
+  - **Get**: Get returns the global config instance.
+  - **Load**: Load initializes the configuration from environment variables...
+  - **Save**: Save persists the current config to disk.
+  - **Validate**: Validate validates the configuration
+
+  ## Usage Example
+  config.UpdateAgentModel(input)
+
+  ## Depended by
+  agent, api, mcpclient, permission, tools
+```
+
+Each entry's description is extracted from function docstrings in source code.
+The "Depended by" list is calculated from the dependency graph.
+Design intent descriptions must be written by the agent (yanxi warns if missing).
+
+---
+
+## 18 MCP Tools
+
+### Project Entry
+
+| Tool | What it does |
+|------|-------------|
+| `module_discover` | Level 1 + Level 2. Project summary, module digest, dependency graph, warnings, lessons. Agent's first call. |
+| `module_report` | Project health dashboard: heatmap (core modules by dependents), risk score (unvalidated/failed/deprecated ratio), dead module detection. |
+
+### Module Lifecycle
+
+| Tool | What it does |
+|------|-------------|
+| `module_create` | Generate module skeleton (module.json + handler stub) in Go/Python/TS/JS. Non-built-in languages get an LLM bootstrap prompt. |
+| `module_bootstrap` | One-shot: create + wire + sync. Rolls back on failure. |
+| `module_read` | Level 3 detail: AIexplain card + interface + source preview. |
+| `module_validate` | 6-stage validation pipeline — see below. |
+| `module_wire` | Generate main entry routing + HTTP server (`main -http 8080`). Blocks on unvalidated modules. |
+| `module_sync` | Apply detected changes: sync entries, calls, version from source code. Yanxi detects → warns → agent calls sync. |
+| `module_adopt` | Analyse external code directory for adoption. Returns LLM prompt for transformation. |
+| `module_adopt_commit` | Finalise adoption: write module, delete original, wire, sync. |
+| `module_deprecate` | Mark module as deprecated/archived. Auto-writes ADR, warns dependents. |
+
+### Knowledge & Memory
+
+| Tool | What it does |
+|------|-------------|
+| `aiexplain_generate` | Incrementally regenerate AIexplain cards + rebuild search index. Only touches changed modules. |
+| `memory_init` | Create project-memory + conventions.json + test_cases.json templates. Idempotent. |
+| `memory_write` | Append to ADR/lesson/convention. Auto-deduplicates lessons. Supports global scope (`~/.yanxi/memory/`). |
+
+### Search & Analysis
+
+| Tool | What it does |
+|------|-------------|
+| `module_search` | BM25/vector search across AIexplain + source code. |
+| `module_search_loose` | Search any directory without micro-architecture. For legacy projects. |
+| `module_check_imports` | Compare declared dependencies vs actual source imports. Flags undeclared/unused. |
+
+### Language Extension
+
+| Tool | What it does |
+|------|-------------|
+| `save_lang_template` | Save an LLM-generated language template. After saving, `module_create` supports the new language with full validate coverage. |
+
+---
+
+## Agent Workflow
+
+### Entering a project
+```
+module_discover() → ~500 tokens, full picture
+  ↓
+module_read("auth") → AIexplain card, understand module
+  ↓
+edit source code
+  ↓
+module_validate("auth") → 6-stage check
+  ↓
+module_sync("auth") → apply detected changes (if any)
+  ↓
+module_wire() → regenerate routing
+  ↓
+aiexplain_generate() → sync knowledge cards
+```
+
+### Creating a new module
+```
+module_create("email", "go") → skeleton
+  ↓ write description (yanxi warns if generic)
+  ↓ write handler code
+  ↓ write test_cases.json (yanxi warns if missing)
+module_validate("email") → check everything
+module_wire() + aiexplain_generate()
+```
+
+### Adopting legacy code
+```
+module_adopt("pkg/util") → analysis + LLM prompt
+  ↓ LLM transforms code
+module_adopt_commit(...) → write + delete original + wire + sync
+```
+
+### Health check
+```
+module_report() → risk score + core modules + dead modules
 ```
 
 ---
 
 ## The Module Contract
 
-Every module in a yanxi project is a directory with source code + a machine-readable contract.
+Every module is a directory with source code + a machine-readable contract.
 
 ```
 source/modules/auth/
-├── auth.py              ← handler action dispatch
-└── module.json          ← contract
+├── auth.py          ← handler/interface implementation
+└── module.json      ← contract (name, version, interface, deps, calls)
 ```
 
 ```json
@@ -141,10 +207,9 @@ source/modules/auth/
   "name": "auth",
   "version": "1.0.0",
   "status": "active",
-  "language": "python",
+  "language": "go",
   "dependencies": ["storage", "session"],
   "interface": {
-    "description": "Authentication and authorisation",
     "entries": {
       "login": {
         "description": "Authenticate user, return JWT",
@@ -163,34 +228,22 @@ source/modules/auth/
             "expires_in": {"type": "integer"}
           }
         }
-      },
-      "logout": {
-        "description": "Invalidate session",
-        "input_schema": {
-          "type": "object",
-          "required": ["token"],
-          "properties": {
-            "token": {"type": "string"}
-          }
-        },
-        "output_schema": {
-          "type": "object",
-          "properties": {
-            "ok": {"type": "boolean"}
-          }
-        }
+      }
+    },
+    "provides": {
+      "AuthService": {
+        "description": "Authentication service interface",
+        "methods": ["Login", "Logout", "VerifyToken"]
+      }
+    },
+    "uses": {
+      "storage.StorageService": {
+        "methods": ["Save", "Load"]
       }
     },
     "calls": {
-      "storage": {
-        "save_session": {
-          "input": "session_data",
-          "output": "session_id"
-        }
-      }
-    },
-    "middleware": {
-      "before": ["auth.verify_token"]
+      "storage": {"save_session": {}},
+      "config": {"handler": {}}
     }
   }
 }
@@ -200,232 +253,103 @@ Key fields:
 
 | Field | Purpose |
 |-------|---------|
-| `name` | Module identifier, matches directory name |
-| `version` | SemVer — bump on every change (yanxi detects breaking diffs) |
-| `status` | `wip` → `active` → `deprecated` → `archived` |
-| `language` | `python` / `go` / `typescript` / `javascript` (+ extensible via LLM templates) |
-| `dependencies` | Other yanxi modules this module relies on |
-| `interface.entries` | Entry points: each is a function with input/output JSON Schema |
-| `interface.calls` | Cross-module calls this module makes to other modules' entries |
-| `interface.middleware` | Before/after hooks referencing other modules' entries |
+| `entries` | Dispatchable entry points with JSON Schema i/o |
+| `provides` | Interfaces this module exports (for Go struct/pubsub) |
+| `uses` | Interfaces this module consumes (cross-module contract) |
+| `calls` | Direct module-to-module function calls |
+| `dependencies` | Upstream modules for dependency graph |
+| `middleware` | Before/after hooks referencing other modules |
 
 ---
 
-## 18 MCP Tools — Complete Reference
+## Validation Pipeline (6 Stages)
 
-### 1. `module_discover` — Enter a project
-Agent's first call. Returns Level 1 (project summary) + Level 2 (module digest) in ~500 tokens. Supports:
-- **Cached mode**: mtime-based cache, 50 modules in ~2ms instead of 50 reads
-- **Deprecation marking**: deprecated/archived modules shown with ⚠ prefix
-- **Dependency warnings**: broken deps + circular deps flagged immediately
+`module_validate("auth")` runs these stages in order:
 
-### 2. `module_create` — Skeleton a new module
-Generates `module.json` + handler stub in any supported language. If the language isn't built-in, returns a self-contained prompt for an LLM to generate the template — yanxi saves it and uses it going forward.
+### Stage 1 — Structure (hard fail)
+- module.json exists, JSON valid
+- Required fields: name, version, status, interface
+- Implementation file exists and readable
 
-### 3. `module_read` — Deep-dive a module
-Returns Level 3: full contract, AIexplain knowledge card, interface reference, and source preview (first 2000 chars). Agent decides what to do next.
+### Stage 2 — Source (hard fail)
+- Entry functions exist (language-specific regex from template)
+- Lifecycle hooks: setup/teardown/health exist if declared
+- Dependencies exist as target module.json files
+- Import consistency: declared vs actual cross-module imports
 
-### 4. `module_validate` — The heart of yanxi
-A 6-stage validation pipeline (detailed [below](#the-validation-pipeline-6-stages)). Runs structural checks, source analysis, cross-module contract verification, runtime tests, schema diff, and downstream compatibility — in a single call.
-
-### 5. `module_wire` — Connect modules
-Generates the project's main entry point (`source/main/main.{py,ts,go}`) with all module imports and routing dispatch. Blocks if any module is unvalidated or has failed validation — prevents broken builds.
-
-### 6. `module_bootstrap` — One-shot: create + wire + sync
-Shortcut for `module_create → module_wire → aiexplain_generate`. Used when adding a new module to an existing project.
-
-### 7. `aiexplain_generate` — Sync knowledge
-Incrementally regenerates AIexplain knowledge cards (mtime-based, only touches changed modules). Also rebuilds BM25 search index. Run after any source change.
-
-### 8. `module_search` — Find code by concept
-BM25 search across all AIexplain cards + source code. Optional vector mode (compile with `-tags vector`). Filters by `kind` (aiexplain/source/all).
-
-### 9. `module_search_loose` — Search anything
-Full-text search against any directory, no architecture required. Use for legacy projects or codebases you haven't adopted yet.
-
-### 10. `module_check_imports` — Import hygiene
-Compares `module.json` declared dependencies against actual imports in source code. Flags undeclared and unused dependencies.
-
-### 11. `memory_init` — Bootstrap project memory
-Creates `.yanxi/project.json` + `project-memory/` with ADR/lesson/convention templates. Idempotent — safe to re-run. `module_discover` suggests this when project memory is missing.
-
-### 12. `memory_write` — Record experience
-Appends to `architecture-decisions.md`, `lessons-learned.md`, or `conventions.md`. Auto-deduplicates lessons to avoid repetitive entries.
-
-### 13. `module_adopt` — Digest external code
-Analyses a project-local directory (e.g. `pkg/util/`, `internal/helpers/`) and returns a self-contained LLM prompt for transforming it into a yanxi module. The prompt instructs the LLM to keep all internal functions unchanged and add a thin handler layer on top.
-
-### 14. `module_adopt_commit` — Finalise adoption
-Takes LLM-transformed code, writes it to `source/modules/<name>/`, generates `module.json`, **deletes the original directory** (atomicity), runs `module_wire` + `aiexplain_generate`. One call completes the adoption.
-
-### 15. `module_deprecate` — Retire modules
-Sets a module's status to `deprecated` or `archived`, automatically writes an ADR recording the decision and reason, and warns all modules that still depend on it.
-
-### 16. `module_sync` — Apply pending changes
-Scans source code for undeclared exports and cross-module calls, detects breaking schema changes, and writes them to `module.json` after agent confirmation. Yanxi detects → warns → agent calls `module_sync` to apply. Never writes without explicit action.
-
-### 17. `module_report` — Project health dashboard
-Aggregates project-level data: **heatmap** (core modules by dependency count), **risk score** (unvalidated + failed + deprecated ratio), **dead module detection** (zero dependents + zero changes). Pure data aggregation, no new infrastructure.
-
-### 18. `save_lang_template` — Extend languages
-Saves an LLM-generated language template to `.yanxi/lang-templates/<lang>.json`. After saving, `module_create` supports the new language. Built-in: Go, Python, TypeScript, JavaScript.
-
----
-
-## The Validation Pipeline (6 Stages)
-
-`module_validate("auth")` runs these stages in order. Each stage either passes (no action needed), warns (degraded but functional), or fails (module cannot wire).
-
-### Stage 1 — Structural Integrity (hard fail)
-
-| Check | Method |
-|-------|--------|
-| module.json exists | File presence |
-| JSON is valid | `json.Unmarshal` |
-| Required fields present | `name`, `version`, `status`, `interface` |
-| Implementation file exists | `source/modules/<name>/<name>.<ext>` |
-| Group modules | Recursive child validation |
-
-### Stage 2 — Source-Level Checks (hard fail)
-
-| Check | Method |
-|-------|--------|
-| Entry functions exist | Language-specific regex: `def handler(`, `func Handler(`, `function handler(` |
-| Lifecycle hooks exist | `setup()`, `teardown()`, `health()` if declared |
-| Dependencies exist | Target `module.json` presence |
-| Import consistency | Declared vs actual cross-module imports |
-
-### Stage 3 — Cross-Module Contract Checks
-
-| Check | What it detects |
-|-------|----------------|
-| **Calls validity** | Every `calls` declaration points to a real module + real entry. Flags broken references. |
-| **Middleware validity** | Every `middleware.before/after` ref points to a real module entry. Flags missing functions. |
-| **Deprecated upstream** | Any dependency is marked `deprecated` or `archived`. Warns the caller to plan migration. |
-| **Downstream compatibility** | When schema changed: scans all modules that call this module and checks if their calls still target valid entries. Flags affected callers. |
-| **Interface contracts (provides/uses)** | Validates that `uses` declarations match a provider's `provides` interface and methods. Flags broken interface references. |
-| **Module granularity** | Warnings for >7 entries (suggest split) and vague module names (`utils`, `common`, `stuff`). |
+### Stage 3 — Cross-Module Contracts
+- **Calls validity**: every call targets a real module + real entry
+- **Middleware validity**: every middleware ref points to a real entry
+- **Deprecated upstream**: any dependency is deprecated/archived → warning
+- **Downstream compatibility**: schema changes → scan affected callers
+- **Interface contracts**: `uses` declarations match provider's `provides`
+- **Module granularity**: >7 entries or vague name → warning
 
 ### Stage 4 — Deep Analysis (warnings)
+- Import classification: known/local/third_party/stdlib
+- Side-effect detection: file/net/global mutations
+- Streaming check: declared streaming but no yield/generator
+- Convention checks: project-specific rules from conventions.json
 
-| Check | Method |
-|-------|--------|
-| Import classification | `ScanImports` categorises every import as `known` (yanxi module), `local` (project package → suggests `module_adopt`), `third_party`, or `stdlib` |
-| Side-effect detection | Source scan for `file.Write`, `net.Dial`, global mutation patterns |
-| Streaming check | Declared streaming but no `yield`/`generator` pattern |
-| Error declarations | Lists declared error codes for documentation |
+### Stage 5 — Runtime
+- **Custom test cases**: loads test_cases.json if present. WARNING if missing.
+- Auto-generated tests: from input_schema (normal values, missing required, invalid enum)
+- Multi-language execution: python -c / go run / node -e subprocess
+- Latency benchmark vs max_latency_ms
+- Strict mode: input/output validated against JSON Schema types
 
-### Stage 5 — Runtime Verification
-
-| Check | Method |
-|-------|--------|
-| Auto-generated test cases | From `input_schema`: normal values, missing required fields, invalid enum values |
-| Multi-language execution | `python -c` / `node -e` / `go run` subprocess |
-| Latency benchmark | Execution time vs `max_latency_ms` constraint |
-| Coverage report | `(tested input combinations / total) × 100%` |
-| Strict mode | Input and output validated against JSON Schema types |
-
-### Stage 6 — Change Detection & Notification
-
-| Check | Method |
-|-------|--------|
-| Schema diff | Compare current `interface` against `.yanxi/schema_cache/` — detects added, removed, and incompatible changes |
-| Downstream broadcasting | When incompatible changes detected: auto-writes to `lessons-learned.md` for every dependent module |
-| Validation state persistence | Writes result to `.yanxi/validation_state.json` — `module_wire` blocks on failure |
+### Stage 6 — Change Detection
+- Schema diff: compare against previous version cache
+- Version bump suggestion if breaking changes detected
+- Downstream broadcasting to dependent modules
 
 ---
 
-## Module Lifecycle
+## Yanxi vs Agent Boundary
 
 ```
-                     ┌──────────────────┐
-                     │  module_create   │  yanxi generates module.json + handler stub
-                     └────────┬─────────┘
-                              │
-                              ▼
-                     ┌──────────────────┐
-                     │  write handler   │  Agent writes business logic
-                     └────────┬─────────┘
-                              │
-            ┌─────────────────┼──────────────────┐
-            ▼                 ▼                   ▼
-   ┌────────────────┐ ┌────────────────┐ ┌────────────────┐
-   │module_validate │ │ module_wire    │ │aiexplain_gen   │
-   │ 6-stage check  │ │ auto-register  │ │ sync knowledge │
-   └────────┬───────┘ └────────┬───────┘ └────────────────┘
-            │                  │
-            ▼                  ▼
-   ┌─────────────────────────────────────┐
-   │         active module               │
-   │  module_adopt to add legacy code    │
-   │  module_deprecate to retire         │
-   └─────────────────────────────────────┘
+Agent's task                       Who owns it
+─────────────────────────────────────────────────────────────
+Analyse requirements               Agent (LLM)
+Design module decomposition        Agent
+Write handler code                 Agent
+Write test cases                   Agent (yanxi provides framework)
+Describe design intent             Agent (yanxi warns if missing)
+Create module.json skeleton        Yanxi (module_create)
+Register module in routing         Yanxi (module_wire)
+Validate everything                Yanxi (module_validate — 6 stages)
+Detect breaking interface changes  Yanxi (schema diff)
+Sync knowledge cards               Yanxi (aiexplain_generate)
+Record design decisions            Yanxi (memory_write)
+Tell next agent about pitfalls     Yanxi (lessons-learned.md)
+Start HTTP server                  Yanxi (module_wire generates net/http)
 ```
+
+**Rule**: mechanical, repetitive, forgettable tasks → yanxi automates.
+Tasks requiring domain knowledge, design intent, or business logic → agent owns.
 
 ---
 
-## Project Structure
-
-```
-<project>/
-├── .yanxi/                          ← tool state (auto-managed)
-│   ├── project.json                 ← project metadata
-│   ├── discover_cache.json          ← mtime-based discovery cache
-│   ├── last_sync.json               ← AIexplain incremental sync
-│   ├── search_index.json            ← BM25 index
-│   ├── schema_cache/<module>.json   ← previous schema for diff
-│   ├── validation_state.json        ← per-module pass/fail history
-│   └── lang-templates/<lang>.json   ← LLM-generated language templates
-├── source/
-│   ├── main/main.{py|ts|go}        ← wired entry point (generated)
-│   └── modules/<name>/
-│       ├── <name>.{py|ts|go}       ← handler(input: dict) → dict
-│       └── module.json             ← contract (name, version, interface, deps, calls)
-├── AIexplain/                       ← agent-readable knowledge (auto-generated)
-│   ├── project-architecture.md
-│   ├── module-contracts.json
-│   ├── shared-functions-guide.md
-│   └── modules/<name>/
-│       ├── <name>.md               ← module overview
-│       └── interface.md            ← API reference
-├── project-memory/                  ← collective memory
-│   ├── architecture-decisions.md   ← ADR records
-│   ├── lessons-learned.md          ← auto-written by validate failures
-│   └── conventions.md              ← project coding conventions
-├── INDEX.md                        ← module registry (generated by module_wire)
-└── .mcp.json                       ← MCP client config
-```
-
----
-
-## What Yanxi Explicitly Does NOT Do
+## What Yanxi Does NOT Do
 
 | Not done | Why |
 |----------|-----|
-| HTTP server generation | Agent generates FastAPI/Gin in 5 seconds with LLM. Yanxi doing it is over-engineering. |
-| Module sandbox / process isolation | Single-machine development only. Production isolation is agent's job. |
-| Event bus runtime | Yanxi doesn't prescribe a runtime. Agent adds one when needed. |
-| Custom test framework | Agent uses `pytest` / `go test`. Yanxi only runs auto-generated smoke tests. |
-| Dockerfile / CI generation | Deployment varies per project. Agent decides. |
-| Code generation beyond stubs | Yanxi generates structure (module.json, routes). Agent writes business logic. |
+| Business logic validation | Yanxi validates structure, not correctness. Agent writes test_cases.json. |
+| Code generation beyond stubs | Yanxi generates module.json + routes. Agent writes business logic. |
+| HTTP server framework | Yanxi generates net/http. Agent can wrap with FastAPI/Gin. |
+| Module sandbox / process isolation | Single-machine development only. |
+| Dockerfile / CI generation | Deployment varies per project — agent decides. |
 
 ---
 
 ## Build & Run
 
-### Build
-
 ```powershell
 cd cmd\yanxi-mcp
 go build -o yanxi-mcp.exe .
-# → 6 MB single binary, zero dependencies
-```
+# → 6 MB single binary, zero external dependencies
 
-### Configure MCP client
-
-Add to your `.mcp.json`:
-
-```json
+# Configure MCP client
 {
   "mcpServers": {
     "yanxi-single": {
@@ -436,19 +360,14 @@ Add to your `.mcp.json`:
 }
 ```
 
-### Test
+### First steps
 
-```powershell
-cd test-project
-.\test-all-tools.ps1
 ```
-
-### Extend to a new language
-
-```python
-# 1. Call save_lang_template with an LLM-generated template
-# 2. module_create("newmod", language="rust")  # works immediately
-# See .yanxi/lang-templates/ for examples
+1. module_discover() → understand project
+2. memory_init() → create project-memory + test templates
+3. module_create("first", "go") → add a module
+4. module_validate("first") → run validation
+5. module_wire() → generate routing
 ```
 
 ---
