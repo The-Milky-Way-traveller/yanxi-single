@@ -33,7 +33,7 @@ These two mechanisms form a closed loop: contracts enable validation, validation
 - [Agent-First Design](#agent-first-design)
 - [Three Information Layers](#three-information-layers)
 - [The Module Contract](#the-module-contract)
-- [16 MCP Tools — Complete Reference](#16-mcp-tools--complete-reference)
+- [18 MCP Tools — Complete Reference](#18-mcp-tools--complete-reference)
 - [The Validation Pipeline (6 Stages)](#the-validation-pipeline-6-stages)
 - [Module Lifecycle](#module-lifecycle)
 - [Project Structure](#project-structure)
@@ -211,7 +211,7 @@ Key fields:
 
 ---
 
-## 16 MCP Tools — Complete Reference
+## 18 MCP Tools — Complete Reference
 
 ### 1. `module_discover` — Enter a project
 Agent's first call. Returns Level 1 (project summary) + Level 2 (module digest) in ~500 tokens. Supports:
@@ -261,7 +261,13 @@ Takes LLM-transformed code, writes it to `source/modules/<name>/`, generates `mo
 ### 15. `module_deprecate` — Retire modules
 Sets a module's status to `deprecated` or `archived`, automatically writes an ADR recording the decision and reason, and warns all modules that still depend on it.
 
-### 16. `save_lang_template` — Extend languages
+### 16. `module_sync` — Apply pending changes
+Scans source code for undeclared exports and cross-module calls, detects breaking schema changes, and writes them to `module.json` after agent confirmation. Yanxi detects → warns → agent calls `module_sync` to apply. Never writes without explicit action.
+
+### 17. `module_report` — Project health dashboard
+Aggregates project-level data: **heatmap** (core modules by dependency count), **risk score** (unvalidated + failed + deprecated ratio), **dead module detection** (zero dependents + zero changes). Pure data aggregation, no new infrastructure.
+
+### 18. `save_lang_template` — Extend languages
 Saves an LLM-generated language template to `.yanxi/lang-templates/<lang>.json`. After saving, `module_create` supports the new language. Built-in: Go, Python, TypeScript, JavaScript.
 
 ---
@@ -297,6 +303,8 @@ Saves an LLM-generated language template to `.yanxi/lang-templates/<lang>.json`.
 | **Middleware validity** | Every `middleware.before/after` ref points to a real module entry. Flags missing functions. |
 | **Deprecated upstream** | Any dependency is marked `deprecated` or `archived`. Warns the caller to plan migration. |
 | **Downstream compatibility** | When schema changed: scans all modules that call this module and checks if their calls still target valid entries. Flags affected callers. |
+| **Interface contracts (provides/uses)** | Validates that `uses` declarations match a provider's `provides` interface and methods. Flags broken interface references. |
+| **Module granularity** | Warnings for >7 entries (suggest split) and vague module names (`utils`, `common`, `stuff`). |
 
 ### Stage 4 — Deep Analysis (warnings)
 
