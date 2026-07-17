@@ -1,4 +1,4 @@
-# Yanxi — Agent-First Micro-Module Architecture
+# Yanxi (盐析) — Agent-First Micro-Module Architecture
 
 <p align="center">
   <b>A 6 MB, zero-dependency MCP server that structures codebases for AI agents.</b>
