@@ -125,6 +125,7 @@ func main() {
 				"side_effects": r.SideEffects, "benchmarks": r.Benchmarks, "coverage": r.Coverage,
 				"call_issues": r.CallIssues, "deprecated_deps": r.DeprecatedDeps,
 				"middleware_issues": r.MiddlewareIssues,
+				"transport_issues": r.TransportIssues,
 				"next_step": ns,
 			}
 			return result, nil

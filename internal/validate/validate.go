@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"yanxi-single/internal/check"
+	"yanxi-single/internal/orchestrator/langtmpl"
 )
 
 type Result struct {
@@ -31,6 +32,7 @@ type Result struct {
 	CallIssues      []string             `json:"call_issues,omitempty"`
 	DeprecatedDeps  []string             `json:"deprecated_deps,omitempty"`
 	MiddlewareIssues []string            `json:"middleware_issues,omitempty"`
+	TransportIssues []string             `json:"transport_issues,omitempty"`
 }
 
 type LifecycleResult struct {
@@ -114,9 +116,16 @@ func ValidateModule(root, modName string) Result {
 		if t, ok := lcRaw["teardown"].(string); ok { lcTeardown = t }
 		if h, ok := lcRaw["health"].(string); ok { lcHealth = h }
 	}
+	// Resolve language template for validate patterns
+	langTmpl, tmplErr := langtmpl.Resolve(root, lang)
+
 	for _, fn := range []string{lcSetup, lcTeardown, lcHealth} {
 		if fn == "" { continue }
-		fnRe := regexp.MustCompile(`(def|func|function)\s+` + regexp.QuoteMeta(fn) + `\s*\(`)
+		pat := `(?:def|func|function)\s+` + regexp.QuoteMeta(fn) + `\s*\(`
+		if tmplErr == nil {
+			pat = langTmpl.LifecycleRegex(fn)
+		}
+		fnRe := regexp.MustCompile(pat)
 		if !fnRe.MatchString(src) {
 			r.Valid = false
 			r.Errors = append(r.Errors, "Lifecycle function '"+fn+"' not found in source")
@@ -131,14 +140,45 @@ func ValidateModule(root, modName string) Result {
 	r.Lifecycle = &LifecycleResult{Setup: setupTr}
 
 	for _, entry := range entryList {
-		var handlerRe *regexp.Regexp
-		switch lang {
-		case "python": handlerRe = regexp.MustCompile(`def\s+` + regexp.QuoteMeta(entry) + `\s*\(`)
-		case "typescript", "javascript": handlerRe = regexp.MustCompile(`(function\s+` + regexp.QuoteMeta(entry) + `|` + regexp.QuoteMeta(entry) + `\s*[=:]\s*(async\s*)?function|` + regexp.QuoteMeta(entry) + `\s*[=:]\s*\(.*\)\s*=>)`)
-		case "go": handlerRe = regexp.MustCompile(`func\s+` + regexp.QuoteMeta(entry) + `\s*\(`)
-		default: handlerRe = regexp.MustCompile(`def\s+` + regexp.QuoteMeta(entry) + `\s*\(`)
+		pat := `def\s+` + regexp.QuoteMeta(entry) + `\s*\(`
+		if tmplErr == nil {
+			pat = langTmpl.EntryRegex(entry)
 		}
+		handlerRe := regexp.MustCompile(pat)
 		if !handlerRe.MatchString(src) { r.Valid = false; r.Errors = append(r.Errors, "Entry '"+entry+"' not found") }
+	}
+
+	// ── Entry Auto-Sync (v1.0.0) ──
+	// Scan source for exportable functions not declared in entries, auto-add them
+	exportPat := `(?m)^(?:def|func|function)\s+(\w+)`
+	if tmplErr == nil && langTmpl.Validate.ExportFuncRegex != "" {
+		exportPat = langTmpl.ExportFuncRegex()
+	}
+	exportRe := regexp.MustCompile(exportPat)
+	declaredSet := make(map[string]bool)
+	for _, e := range entryList {
+		declaredSet[e] = true
+	}
+	var newEntries []string
+	for _, m := range exportRe.FindAllStringSubmatch(src, -1) {
+		if len(m) > 1 {
+			fn := m[1]
+			// Skip private/internal and common Go/Python specials
+			if strings.HasPrefix(fn, "_") || fn == "init" || fn == "main" || fn == "Handler" {
+				continue
+			}
+			if !declaredSet[fn] {
+				newEntries = append(newEntries, fn)
+				declaredSet[fn] = true
+			}
+		}
+	}
+	if len(newEntries) > 0 {
+		// Auto-write into module.json
+		if ifaceRaw != nil {
+			autoSyncEntries(root, modName, ifaceRaw, newEntries, lang)
+		}
+		r.Warnings = append(r.Warnings, fmt.Sprintf("Auto-synced %d entries from source: %v", len(newEntries), newEntries))
 	}
 
 	// ── Error declarations (v5.3.0) ──
@@ -185,11 +225,21 @@ func ValidateModule(root, modName string) Result {
 	// 1. Calls: every declared call target must exist (upstream check)
 	r.CallIssues = checkModuleCalls(root, modName, contract)
 
+	// 1b. Calls auto-infer: scan source for cross-module call patterns not yet declared
+	inferredCalls := inferModuleCalls(src, modName, lang)
+	if len(inferredCalls) > 0 {
+		autoSyncCalls(root, modName, contract, inferredCalls)
+		r.Warnings = append(r.Warnings, fmt.Sprintf("Auto-synced %d calls from source", len(inferredCalls)))
+	}
+
 	// 2. Middleware: every declared middleware function must exist as an entry in target module
 	r.MiddlewareIssues = checkMiddlewareTargets(root, modName, contract)
 
 	// 3. Deprecated dependencies: warn if any upstream module is deprecated
 	r.DeprecatedDeps = checkDeprecatedDeps(root, modName, contract)
+
+	// 4. Transport validation: check HTTP route declarations
+	r.TransportIssues = checkTransportHTTP(root, modName, contract)
 
 	// ── Schema Diff (v5.3.0) ──
 	breakingChanges := CompareModuleSchemas(root, modName, contract)
@@ -210,6 +260,16 @@ func ValidateModule(root, modName string) Result {
 		}
 	}
 	saveSchemaCache(root, modName, contract)
+
+	// ── Version Auto-Bump (v1.0.0) ──
+	if hasBreakingVersion(r.BreakingChanges) {
+		bumpVersion(contract, "major")
+		// Write back updated module.json
+		if newData, err := json.MarshalIndent(contract, "", "  "); err == nil {
+			os.WriteFile(modJSONPath, newData, 0644)
+		}
+		r.Warnings = append(r.Warnings, "Version auto-bumped to major (breaking changes)")
+	}
 
 	// ── Downstream Compatibility (v5.4.0) ──
 	// When schema changed, check if dependent modules' calls still target valid entries
@@ -387,8 +447,70 @@ func ValidateModule(root, modName string) Result {
 	if len(r.DeprecatedDeps) > 0 {
 		r.Warnings = append(r.Warnings, "Deprecated dependencies: "+strings.Join(r.DeprecatedDeps, "; "))
 	}
+	if len(r.TransportIssues) > 0 {
+		r.Warnings = append(r.Warnings, "Transport issues: "+strings.Join(r.TransportIssues, "; "))
+	}
 
 	return r
+}
+
+func checkTransportHTTP(root, modName string, contract map[string]interface{}) []string {
+	transportRaw, ok := contract["transport"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	httpRaw, ok := transportRaw["http"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	routesRaw, ok := httpRaw["routes"].(map[string]interface{})
+	if !ok || len(routesRaw) == 0 {
+		return []string{"transport.http.routes is empty"}
+	}
+
+	// Load interface entries for entry name validation
+	ifaceRaw, _ := contract["interface"].(map[string]interface{})
+	entrySet := map[string]bool{}
+	if ifaceRaw != nil {
+		if ents, hasE := ifaceRaw["entries"].(map[string]interface{}); hasE {
+			for k := range ents {
+				entrySet[k] = true
+			}
+		} else if entry, _ := ifaceRaw["entry"].(string); entry != "" {
+			entrySet[entry] = true
+		} else {
+			entrySet["handler"] = true
+		}
+	}
+
+	var issues []string
+	validMethods := map[string]bool{"GET": true, "POST": true, "PUT": true, "DELETE": true, "PATCH": true, "HEAD": true, "OPTIONS": true}
+	for entryName, routeRaw := range routesRaw {
+		route, _ := routeRaw.(map[string]interface{})
+		if route == nil {
+			issues = append(issues, fmt.Sprintf("transport.http route %q: invalid route definition", entryName))
+			continue
+		}
+		// Check entry exists
+		if len(entrySet) > 0 && !entrySet[entryName] {
+			issues = append(issues, fmt.Sprintf("transport.http route %q: entry not declared in interface", entryName))
+		}
+		// Check method
+		if method, _ := route["method"].(string); method != "" {
+			if !validMethods[method] {
+				issues = append(issues, fmt.Sprintf("transport.http route %q: invalid method %q", entryName, method))
+			}
+		}
+		// Check path
+		if path, _ := route["path"].(string); path != "" {
+			if path[0] != '/' {
+				issues = append(issues, fmt.Sprintf("transport.http route %q: path must start with /", entryName))
+			}
+		} else {
+			issues = append(issues, fmt.Sprintf("transport.http route %q: missing path", entryName))
+		}
+	}
+	return issues
 }
 
 func checkModuleCalls(root, modName string, contract map[string]interface{}) []string {
@@ -534,6 +656,100 @@ func checkDownstreamCompatibility(root, changedModule string, contract map[strin
 		}
 	}
 	return issues
+}
+
+func autoSyncEntries(root, modName string, ifaceRaw map[string]interface{}, newEntries []string, lang string) {
+	modJSONPath := filepath.Join(root, "source", "modules", modName, "module.json")
+	data, err := os.ReadFile(modJSONPath)
+	if err != nil {
+		return
+	}
+	var contract map[string]interface{}
+	if json.Unmarshal(data, &contract) != nil {
+		return
+	}
+	ifaceRaw2, _ := contract["interface"].(map[string]interface{})
+	if ifaceRaw2 == nil {
+		return
+	}
+
+	// Check if module uses multi-entry format
+	if _, hasEntries := ifaceRaw2["entries"].(map[string]interface{}); hasEntries {
+		// Multi-entry: add each new entry
+		entriesMap, _ := ifaceRaw2["entries"].(map[string]interface{})
+		if entriesMap == nil {
+			entriesMap = make(map[string]interface{})
+			ifaceRaw2["entries"] = entriesMap
+		}
+		for _, fn := range newEntries {
+			entryHn := fn
+			if lang == "go" && len(fn) > 0 {
+				entryHn = strings.ToUpper(fn[:1]) + fn[1:]
+			}
+			entriesMap[fn] = map[string]interface{}{
+				"description": fn + " entry (auto-synced)",
+				"input_schema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"action": map[string]interface{}{"type": "string"},
+					},
+				},
+				"output_schema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"result": map[string]interface{}{},
+					},
+				},
+			}
+			_ = entryHn
+		}
+	} else {
+		// Single entry: upgrade to multi-entry format
+		oldEntry, _ := ifaceRaw2["entry"].(string)
+		oldDesc, _ := ifaceRaw2["description"].(string)
+		oldInput, _ := ifaceRaw2["input_schema"]
+		oldOutput, _ := ifaceRaw2["output_schema"]
+
+		entriesMap := make(map[string]interface{})
+		if oldEntry != "" {
+			entryDef := map[string]interface{}{"description": oldDesc}
+			if oldInput != nil {
+				entryDef["input_schema"] = oldInput
+			}
+			if oldOutput != nil {
+				entryDef["output_schema"] = oldOutput
+			}
+			entriesMap[oldEntry] = entryDef
+		}
+		for _, fn := range newEntries {
+			entriesMap[fn] = map[string]interface{}{
+				"description": fn + " entry (auto-synced)",
+				"input_schema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"action": map[string]interface{}{"type": "string"},
+					},
+				},
+				"output_schema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"result": map[string]interface{}{},
+					},
+				},
+			}
+		}
+		// Replace flat interface with entries format
+		delete(ifaceRaw2, "entry")
+		delete(ifaceRaw2, "description")
+		delete(ifaceRaw2, "input_schema")
+		delete(ifaceRaw2, "output_schema")
+		ifaceRaw2["entries"] = entriesMap
+		ifaceRaw2["description"] = modName + " module"
+	}
+
+	// Write back
+	newData, _ := json.MarshalIndent(contract, "", "  ")
+	os.WriteFile(modJSONPath, newData, 0644)
 }
 
 func checkImports(root, modName string) map[string]interface{} {
@@ -736,4 +952,122 @@ func runCmd(cmd string, args []string, tr TestResult) TestResult {
 	if _, hr := output["result"]; !hr { tr.Note = "no 'result' field" }
 	tr.Passed = true
 	return tr
+}
+
+func hasBreakingVersion(breakingChanges []BreakingChange) bool {
+	for _, bc := range breakingChanges {
+		for _, ch := range bc.Changes {
+			if !ch.Compatible {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func bumpVersion(contract map[string]interface{}, level string) {
+	v, _ := contract["version"].(string)
+	if v == "" {
+		contract["version"] = "0.1.0"
+		return
+	}
+	parts := strings.SplitN(v, ".", 3)
+	major, minor, patch := 0, 0, 0
+	if len(parts) > 0 {
+		fmt.Sscanf(parts[0], "%d", &major)
+	}
+	if len(parts) > 1 {
+		fmt.Sscanf(parts[1], "%d", &minor)
+	}
+	if len(parts) > 2 {
+		fmt.Sscanf(parts[2], "%d", &patch)
+	}
+	switch level {
+	case "major":
+		major++
+		minor = 0
+		patch = 0
+	case "minor":
+		minor++
+		patch = 0
+	default:
+		patch++
+	}
+	contract["version"] = fmt.Sprintf("%d.%d.%d", major, minor, patch)
+}
+
+// inferModuleCalls scans source code for cross-module call patterns.
+// Returns a list of "module.entry" strings found in source.
+func inferModuleCalls(src, currentModule, lang string) []string {
+	var calls []string
+	seen := map[string]bool{}
+
+	// Pattern: module_name.function_name()
+	// For all languages, match `module.entry(` style calls
+	re := regexp.MustCompile(`(\w+)\.(\w+)\s*\(`)
+	for _, m := range re.FindAllStringSubmatch(src, -1) {
+		if len(m) < 3 {
+			continue
+		}
+		mod, entry := m[1], m[2]
+		// Skip: self-calls, common keywords, non-module patterns
+		if mod == currentModule || mod == "self" || mod == "this" || mod == "fmt" || mod == "os" || mod == "json" || mod == "log" {
+			continue
+		}
+		// Skip standard library / built-in names
+		if len(mod) <= 2 {
+			continue
+		}
+		// Skip methods on variables (lowercase first letter typical variable)
+		if entry == "Error" || entry == "String" || entry == "error" {
+			continue
+		}
+		key := mod + "." + entry
+		if !seen[key] {
+			seen[key] = true
+			calls = append(calls, key)
+		}
+	}
+	return calls
+}
+
+// autoSyncCalls writes discovered calls into module.json's interface.calls.
+func autoSyncCalls(root, modName string, contract map[string]interface{}, inferred []string) {
+	ifaceRaw, _ := contract["interface"].(map[string]interface{})
+	if ifaceRaw == nil {
+		return
+	}
+
+	// Read existing calls
+	callsRaw, _ := ifaceRaw["calls"].(map[string]interface{})
+	if callsRaw == nil {
+		callsRaw = make(map[string]interface{})
+		ifaceRaw["calls"] = callsRaw
+	}
+
+	for _, callStr := range inferred {
+		parts := strings.SplitN(callStr, ".", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		tgtModule, tgtEntry := parts[0], parts[1]
+
+		// Check if already declared
+		if existingEntries, ok := callsRaw[tgtModule].(map[string]interface{}); ok {
+			if _, exists := existingEntries[tgtEntry]; exists {
+				continue
+			}
+			existingEntries[tgtEntry] = map[string]interface{}{}
+		} else {
+			callsRaw[tgtModule] = map[string]interface{}{
+				tgtEntry: map[string]interface{}{},
+			}
+		}
+	}
+
+	// Write back
+	modJSONPath := filepath.Join(root, "source", "modules", modName, "module.json")
+	if newData, err := json.MarshalIndent(contract, "", "  "); err == nil {
+		os.WriteFile(modJSONPath, newData, 0644)
+	}
 }

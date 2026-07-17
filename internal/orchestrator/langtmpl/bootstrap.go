@@ -35,16 +35,16 @@ Return ONLY valid JSON (no markdown) with this exact structure:
     "map_entry_line": "handler map entry for Go-style, or empty for if/elif style",
     "use_map_pattern": true or false
   },
+  "validate": {
+    "entry_regex": "regex to find an entry function in source code. Use {{.Entry}} as placeholder for the entry name. Example for Python: 'def\\s+{{.Entry}}\\s*\\('",
+    "lifecycle_regex": "regex to find a lifecycle function (setup/teardown/health). Use {{.Name}} placeholder.",
+    "export_func_regex": "regex to extract all exported function/type/variable names from source. Must capture the name in group 1.",
+    "import_extract_regex": "regex to extract all import paths/statements from source code.",
+    "test_runtime": "command template to run a test file. Use {{.File}} placeholder.",
+    "stdlib_pattern": "regex pattern matching standard library package prefixes. Example: '^(os|sys|json|re)'"
+  },
   "default_entry": "handler or Handler"
 }
 
-Examples:
-
-For Python:
-{"language":"python","ext":"py","handler":{"capitalize_entry":false,"package_decl":"","import_syntax":"from source.modules.{{.Name}}.{{.Name}} import {{.Entry}} as handler_{{.Name}}","handler_ref":"handler_{{.Name}}","comment":"#","stub_tmpl":"\"\"\"{{.Name}} module\"\"\"\n\ndef {{.Entry}}(d):\n    return {\"result\": f\"{d.get('action','')} not implemented\"}\n","stub_entries_tmpl":"\"\"\"{{.Name}} module\"\"\"\n\n{{range .Entries}}\ndef {{.}}(d):\n    return {\"result\": \"{{.}} not implemented\"}\n\n{{end}}"},"wire":{"import_line":"from source.modules.{{.Name}}.{{.Name}} import {{.Entry}} as handler_{{.Name}}","map_entry_line":"","use_map_pattern":false},"default_entry":"handler"}
-
-For Go:
-{"language":"go","ext":"go","handler":{"capitalize_entry":true,"package_decl":"package {{.Name}}","import_syntax":"import {{.Alias}} \"project/source/modules/{{.Name}}\"","handler_ref":"{{.Alias}}.Handler","comment":"//","stub_tmpl":"package {{.Name}}\n\nimport \"fmt\"\n\nfunc {{.Entry}}(d map[string]interface{}) map[string]interface{} {\n    return map[string]interface{}{\"result\": fmt.Sprintf(\"%%v not implemented\", d[\"action\"])}\n}\n","stub_entries_tmpl":"package {{.Name}}\n\nimport \"fmt\"\n{{range .Entries}}\nfunc {{.}}(d map[string]interface{}) map[string]interface{} {\n    return map[string]interface{}{\"result\": \"{{.}} not implemented\"}\n}\n{{end}}"},"wire":{"import_line":"{{.Alias}} \"project/source/modules/{{.Name}}\"","map_entry_line":"\"{{.Name}}\": wrap({{.Alias}}.{{.Entry}}),","use_map_pattern":true},"default_entry":"Handler"}
-
-Return ONLY the JSON object, no explanation, no markdown.`, lang, lang)
+Provide realistic, working regex patterns for %s source code analysis.`, lang, lang, lang)
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"text/template"
 )
@@ -55,6 +56,27 @@ type LangTemplate struct {
 		// Whether the wire file uses a "handlers map" pattern (Go) vs "if/elif" (Python)
 		UseMapPattern bool `json:"use_map_pattern"`
 	} `json:"wire"`
+
+	// Validate rules (v1.0.0)
+	Validate struct {
+		// Regex to find entry function definitions in source
+		// Receives {{.Entry}} as the entry name to look for
+		EntryRegex string `json:"entry_regex,omitempty"`
+		// Regex to find lifecycle hook functions
+		// Receives {{.Name}} as the function name
+		LifecycleRegex string `json:"lifecycle_regex,omitempty"`
+		// Regex to extract exportable function/type names from source
+		ExportFuncRegex string `json:"export_func_regex,omitempty"`
+		// Regex to extract cross-module calls from source
+		// Should capture module_name and function_name
+		CallExtractRegex string `json:"call_extract_regex,omitempty"`
+		// Import extraction regex — captures full import paths
+		ImportExtractRegex string `json:"import_extract_regex,omitempty"`
+		// Runtime command for running tests, with {{.File}} placeholder
+		TestRuntime string `json:"test_runtime,omitempty"`
+		// Language standard library packages (comma-separated or regex)
+		StdlibPattern string `json:"stdlib_pattern,omitempty"`
+	} `json:"validate,omitempty"`
 
 	// Module.json defaults
 	DefaultEntry string `json:"default_entry"`
@@ -113,6 +135,13 @@ func {{.}}(d map[string]interface{}) map[string]interface{} {
 	t.Wire.ImportLine = `{{.Alias}} "yanxipro/source/modules/{{.Name}}"`
 	t.Wire.MapEntryLine = `"{{.Name}}": wrap({{.Alias}}.{{.Entry}}),`
 	t.Wire.UseMapPattern = true
+	t.Validate.EntryRegex = `func\s+{{.Entry}}\s*\(`
+	t.Validate.LifecycleRegex = `(?:func|method)\s+{{.Name}}\s*\(`
+	t.Validate.ExportFuncRegex = `(?m)^(?:func|type|var|const)\s+([A-Z]\w*)`
+	t.Validate.CallExtractRegex = ``
+	t.Validate.ImportExtractRegex = `"([^"]+)"`
+	t.Validate.TestRuntime = `go run {{.File}}`
+	t.Validate.StdlibPattern = `^(fmt|os|io|strings|strconv|encoding/json|encoding/xml|regexp|net|net/http|sync|time|log|math|sort|path|path/filepath|flag|bytes|bufio|context|errors|reflect)`
 	t.DefaultEntry = "Handler"
 	return t
 }
@@ -141,6 +170,13 @@ def {{.}}(d):
 	t.Wire.ImportLine = `from source.modules.{{.Name}}.{{.Name}} import {{.Entry}} as handler_{{.Name}}`
 	t.Wire.MapEntryLine = ``
 	t.Wire.UseMapPattern = false
+	t.Validate.EntryRegex = `def\s+{{.Entry}}\s*\(`
+	t.Validate.LifecycleRegex = `(?:def|async def)\s+{{.Name}}\s*\(`
+	t.Validate.ExportFuncRegex = `(?m)^(?:def|class|async def)\s+([a-zA-Z]\w*)\s*\(`
+	t.Validate.CallExtractRegex = ``
+	t.Validate.ImportExtractRegex = `(?m)^\s*(?:import|from)\s+(\S+)`
+	t.Validate.TestRuntime = `python -c {{.File}}`
+	t.Validate.StdlibPattern = `^(os|sys|json|re|math|time|datetime|collections|functools|itertools|pathlib|typing|io|logging|abc|dataclasses|enum|hashlib|copy|random|uuid|inspect|subprocess|threading|http|urllib|base64|csv|glob|xml|html|unittest|argparse)`
 	t.DefaultEntry = "handler"
 	return t
 }
@@ -173,6 +209,13 @@ export function {{.}}(d: Input): Output {
 	t.Wire.ImportLine = `import { {{.Entry}} as {{.Alias}}_{{.Entry}} } from './modules/{{.Name}}/{{.Name}}'`
 	t.Wire.MapEntryLine = ``
 	t.Wire.UseMapPattern = false
+	t.Validate.EntryRegex = `(?:export\s+)?(?:async\s+)?function\s+{{.Entry}}\s*\(|{{.Entry}}\s*[=:]\s*(?:async\s*)?(?:function|\(.*\)\s*=>)`
+	t.Validate.LifecycleRegex = `(?:export\s+)?(?:async\s+)?function\s+{{.Name}}\s*\(|{{.Name}}\s*[=:]\s*(?:async\s*)?function`
+	t.Validate.ExportFuncRegex = `(?m)^(?:export\s+)?(?:function|const|class|let|var)\s+(\w+)`
+	t.Validate.CallExtractRegex = ``
+	t.Validate.ImportExtractRegex = `(?:from|require)\s*\(?\s*['"]([^'"]+)['"]\s*\)?`
+	t.Validate.TestRuntime = `node -e {{.File}}`
+	t.Validate.StdlibPattern = `^(fs|path|os|http|https|url|util|stream|crypto|events|buffer|child_process|assert|querystring|net|dns|cluster|readline|tls|zlib)`
 	t.DefaultEntry = "handler"
 	return t
 }
@@ -311,7 +354,39 @@ func render(tmpl string, data map[string]string) string {
 	return b.String()
 }
 
-// Default returns the default entry name for the language.
+// EntryRegex compiles the entry regex with the given entry name.
+func (t *LangTemplate) EntryRegex(name string) string {
+	if t.Validate.EntryRegex == "" {
+		return `def\s+` + regexp.QuoteMeta(name) + `\s*\(`
+	}
+	return strings.ReplaceAll(t.Validate.EntryRegex, "{{.Entry}}", regexp.QuoteMeta(name))
+}
+
+// LifecycleRegex compiles the lifecycle regex with the given function name.
+func (t *LangTemplate) LifecycleRegex(name string) string {
+	if t.Validate.LifecycleRegex == "" {
+		return `(?:def|func|function)\s+` + regexp.QuoteMeta(name) + `\s*\(`
+	}
+	return strings.ReplaceAll(t.Validate.LifecycleRegex, "{{.Name}}", regexp.QuoteMeta(name))
+}
+
+// ExportFuncRegex returns the compiled export function extraction regex.
+func (t *LangTemplate) ExportFuncRegex() string {
+	if t.Validate.ExportFuncRegex == "" {
+		return `(?m)^(?:def|func|function)\s+(\w+)`
+	}
+	return t.Validate.ExportFuncRegex
+}
+
+// ImportExtractRegex returns the import extraction regex.
+func (t *LangTemplate) ImportExtractRegex() string {
+	if t.Validate.ImportExtractRegex == "" {
+		return `(?:from|import|require)\s+(\S+)`
+	}
+	return t.Validate.ImportExtractRegex
+}
+
+// DefaultEntryName returns the default entry point name for this language.
 func (t *LangTemplate) DefaultEntryName() string {
 	return t.EntryName(t.DefaultEntry)
 }
