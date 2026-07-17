@@ -98,9 +98,9 @@ Descriptions are extracted from function docstrings. Dependents are calculated f
 
 ### What Makes Yanxi Different
 
-**Micro-module contracts.** Every module has a machine-readable `module.json`. Not a document for humans — data for yanxi to validate, diff, and reason about. Typed entry schemas, cross-module call declarations, interface provides/uses, middleware references, error codes.
+**Micro-module contracts.** Every module carries a machine-readable `module.json` alongside its source code. The contract describes typed entry schemas, cross-module call declarations, interface provides/uses, middleware references, and error codes — structured data that yanxi can validate, diff, and reason about.
 
-**Push-based contract verification.** `module_validate("auth")` walks a 6-stage pipeline automatically. Every issue is surfaced to the agent without the agent needing to know what to ask:
+**Push-based contract verification.** `module_validate("auth")` walks a 6-stage pipeline automatically and reports every issue it finds:
 
 - Call references pointing to missing modules or entries
 - Middleware functions that don't exist
