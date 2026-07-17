@@ -33,6 +33,7 @@ type Result struct {
 	DeprecatedDeps  []string             `json:"deprecated_deps,omitempty"`
 	MiddlewareIssues []string            `json:"middleware_issues,omitempty"`
 	TransportIssues []string             `json:"transport_issues,omitempty"`
+	ConventionIssues []string            `json:"convention_issues,omitempty"`
 }
 
 type LifecycleResult struct {
@@ -139,6 +140,25 @@ func ValidateModule(root, modName string) Result {
 	}
 	r.Lifecycle = &LifecycleResult{Setup: setupTr}
 
+	// ── State Management: requires validation (v1.0.0) ──
+	if requiresRaw, ok := contract["requires"].(map[string]interface{}); ok && len(requiresRaw) > 0 {
+		if lcSetup == "" {
+			r.Errors = append(r.Errors, "Module declares 'requires' but no 'lifecycle.setup' function")
+			r.Valid = false
+		} else {
+			// Check each required resource has setup declaring it
+			for resName := range requiresRaw {
+				// For now: check that setup function name contains the resource name
+				// Future: could parse setup() return type
+				resRe := regexp.MustCompile(`(?i)` + regexp.QuoteMeta(resName))
+				if !resRe.MatchString(src) {
+					r.Warnings = append(r.Warnings,
+						fmt.Sprintf("Required resource %q declared but not found in setup function", resName))
+				}
+			}
+		}
+	}
+
 	for _, entry := range entryList {
 		pat := `def\s+` + regexp.QuoteMeta(entry) + `\s*\(`
 		if tmplErr == nil {
@@ -179,6 +199,17 @@ func ValidateModule(root, modName string) Result {
 			autoSyncEntries(root, modName, ifaceRaw, newEntries, lang)
 		}
 		r.Warnings = append(r.Warnings, fmt.Sprintf("Auto-synced %d entries from source: %v", len(newEntries), newEntries))
+	}
+
+	// ── Module Granularity Checks (v1.0.0) ──
+	if len(entryList) > 7 {
+		r.Warnings = append(r.Warnings,
+			fmt.Sprintf("Module %q has %d entries (>7), consider splitting into smaller modules", modName, len(entryList)))
+	}
+	vagueNames := map[string]bool{"utils": true, "stuff": true, "common": true, "helpers": true, "shared": true}
+	if vagueNames[modName] {
+		r.Warnings = append(r.Warnings,
+			fmt.Sprintf("Module name %q is vague. Use a domain-specific name like 'auth' or 'storage' instead.", modName))
 	}
 
 	// ── Error declarations (v5.3.0) ──
@@ -457,6 +488,12 @@ func ValidateModule(root, modName string) Result {
 		r.Warnings = append(r.Warnings, "Transport issues: "+strings.Join(r.TransportIssues, "; "))
 	}
 
+	// ── Convention Checks (v1.0.0) ──
+	r.ConventionIssues = checkConventions(root, modName, src, lang, entryList)
+	if len(r.ConventionIssues) > 0 {
+		r.Warnings = append(r.Warnings, "Convention issues: "+strings.Join(r.ConventionIssues, "; "))
+	}
+
 	return r
 }
 
@@ -658,6 +695,52 @@ func checkDownstreamCompatibility(root, changedModule string, contract map[strin
 				if !newEntries[entryName] {
 					issues = append(issues, fmt.Sprintf("%s calls %s.%s which no longer exists", d.Name(), changedModule, entryName))
 				}
+			}
+		}
+	}
+	return issues
+}
+
+// ConventionRule describes a single project convention rule.
+type ConventionRule struct {
+	ID          string `json:"id"`
+	Rule        string `json:"rule"`
+	Check       string `json:"check"`       // "regex" | "module_name" | "entry_count"
+	Pattern     string `json:"pattern,omitempty"`
+	Forbidden   []string `json:"forbidden,omitempty"`
+	MaxEntries  int    `json:"max_entries,omitempty"`
+	Severity    string `json:"severity"`     // "warning" | "error"
+}
+
+func checkConventions(root, modName, src, lang string, entryList []string) []string {
+	data, err := os.ReadFile(filepath.Join(root, "project-memory", "conventions.json"))
+	if err != nil {
+		return nil
+	}
+	var rules []ConventionRule
+	if json.Unmarshal(data, &rules) != nil {
+		return nil
+	}
+	var issues []string
+	for _, rule := range rules {
+		switch rule.Check {
+		case "regex":
+			if rule.Pattern == "" {
+				continue
+			}
+			matched, _ := regexp.MatchString(rule.Pattern, src)
+			if !matched {
+				issues = append(issues, rule.Rule)
+			}
+		case "module_name":
+			for _, f := range rule.Forbidden {
+				if modName == f {
+					issues = append(issues, rule.Rule)
+				}
+			}
+		case "entry_count":
+			if rule.MaxEntries > 0 && len(entryList) > rule.MaxEntries {
+				issues = append(issues, rule.Rule)
 			}
 		}
 	}

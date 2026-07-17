@@ -1009,11 +1009,22 @@ type BootstrapResult struct {
 
 func BootstrapModule(root, name, language, description string) *BootstrapResult {
 	r := &BootstrapResult{}
+	modDir := filepath.Join(root, "source", "modules", name)
 	if err := CreateModule(root, name, "agent", language); err != nil { r.Errors = append(r.Errors, "create: "+err.Error()); return r }
 	r.Created = true
 	ov := ModuleDiscover(root)
-	if _, err := WireMain(root, ov.Modules); err != nil { r.Warnings = append(r.Warnings, "wire: "+err.Error()) } else { r.Wired = true }
-	r.BuildOrder = ov.BuildOrder; r.ModuleCount = ov.ModuleCount
-	EnsureAIExplain(root); r.Synced = true
+	if _, err := WireMain(root, ov.Modules); err != nil {
+		r.Warnings = append(r.Warnings, "wire: "+err.Error())
+		// Rollback: remove created module files
+		if rmErr := os.RemoveAll(modDir); rmErr == nil {
+			r.Warnings = append(r.Warnings, "rolled back: removed "+modDir)
+		}
+	} else {
+		r.Wired = true
+		r.BuildOrder = ov.BuildOrder
+		r.ModuleCount = ov.ModuleCount
+		EnsureAIExplain(root)
+		r.Synced = true
+	}
 	return r
 }

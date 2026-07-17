@@ -126,6 +126,7 @@ func main() {
 				"call_issues": r.CallIssues, "deprecated_deps": r.DeprecatedDeps,
 				"middleware_issues": r.MiddlewareIssues,
 				"transport_issues": r.TransportIssues,
+				"convention_issues": r.ConventionIssues,
 				"next_step": ns,
 			}
 			return result, nil

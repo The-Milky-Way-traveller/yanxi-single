@@ -202,7 +202,12 @@ func ConfigSummary(cfg *ProjectConfig, moduleCount int, primaryLang string, pm *
 
 // ── Memory Write ──
 
-func MemoryWrite(root, kind, content string) error {
+func MemoryWrite(root, kind, content string, scope ...string) error {
+	s := "project"
+	if len(scope) > 0 && scope[0] == "global" {
+		s = "global"
+	}
+
 	var filename string
 	switch kind {
 	case "adr":
@@ -214,8 +219,13 @@ func MemoryWrite(root, kind, content string) error {
 	default:
 		return fmt.Errorf("unknown memory kind: %q (use adr/lesson/convention)", kind)
 	}
+
 	dir := filepath.Join(root, "project-memory")
-	os.MkdirAll(dir, 0755)
+	if s == "global" {
+		dir = globalMemoryRoot()
+		os.MkdirAll(dir, 0755)
+	}
+
 	f, err := os.OpenFile(filepath.Join(dir, filename), os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
 	if err != nil {
 		return err
@@ -225,18 +235,84 @@ func MemoryWrite(root, kind, content string) error {
 	return err
 }
 
-func MemoryAppendLesson(root, note string) error {
+func MemoryAppendLesson(root, note string, scope ...string) error {
+	s := "project"
+	if len(scope) > 0 && scope[0] == "global" {
+		s = "global"
+	}
 	// Dedup: check if a similar lesson already exists
-	pm := LoadProjectMemory(root)
-	if pm != nil && pm.Lessons != "" {
-		existing := ParseLessons(pm.Lessons)
-		for _, e := range existing {
-			if strings.Contains(e, note) || strings.Contains(note, e) {
-				return nil // already recorded
-			}
+	var existing []string
+	if s == "project" {
+		pm := LoadProjectMemory(root)
+		if pm != nil && pm.Lessons != "" {
+			existing = ParseLessons(pm.Lessons)
+		}
+	} else {
+		gm := LoadGlobalMemory()
+		if gm != nil && gm.Lessons != "" {
+			existing = ParseLessons(gm.Lessons)
 		}
 	}
-	return MemoryWrite(root, "lesson", note)
+	for _, e := range existing {
+		if strings.Contains(e, note) || strings.Contains(note, e) {
+			return nil // already recorded
+		}
+	}
+	args := []string{}
+	if s == "global" {
+		args = []string{"global"}
+	}
+	return MemoryWrite(root, "lesson", note, args...)
+}
+
+// ── Global Memory (cross-project, v1.0.0) ──
+
+func globalMemoryRoot() string {
+	home, _ := os.UserHomeDir()
+	if home == "" {
+		return filepath.Join(".", ".yanxi-global")
+	}
+	return filepath.Join(home, ".yanxi", "memory")
+}
+
+// LoadGlobalMemory loads cross-project ADRs and lessons from ~/.yanxi/memory/.
+func LoadGlobalMemory() *ProjectMemory {
+	root := globalMemoryRoot()
+	pm := &ProjectMemory{}
+	if data, err := os.ReadFile(filepath.Join(root, "lessons-learned.md")); err == nil {
+		pm.Lessons = string(data)
+	}
+	if data, err := os.ReadFile(filepath.Join(root, "conventions.md")); err == nil {
+		pm.Conventions = string(data)
+	}
+	return pm
+}
+
+// EnsureGlobalMemory creates ~/.yanxi/memory/ with template files.
+func EnsureGlobalMemory() {
+	root := globalMemoryRoot()
+	os.MkdirAll(root, 0755)
+
+	templates := map[string]string{
+		"lessons-learned.md": `# Global Lessons Learned
+
+Lessons shared across all projects. Use memory_write(content, kind="lesson", scope="global") to add.
+
+*No global lessons recorded yet.*
+`,
+		"conventions.md": `# Global Conventions
+
+Coding conventions that apply to all projects.
+
+*No global conventions defined yet.*
+`,
+	}
+	for name, tmpl := range templates {
+		path := filepath.Join(root, name)
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			os.WriteFile(path, []byte(tmpl), 0644)
+		}
+	}
 }
 
 // ── Memory Init ──
@@ -261,6 +337,37 @@ func InitProjectMemory(root string) map[string]bool {
 
 	// project-memory/ (idempotent — only creates missing files)
 	EnsureProjectMemory(root)
+
+	// conventions.json structured rules
+	convJSON := filepath.Join(root, "project-memory", "conventions.json")
+	if _, err := os.Stat(convJSON); os.IsNotExist(err) {
+		tmpl := `[
+  {
+    "id": "handler-docstring",
+    "rule": "All handler functions should have a docstring",
+    "check": "regex",
+    "pattern": "//\\s+.+",
+    "severity": "warning"
+  },
+  {
+    "id": "no-vague-module-names",
+    "rule": "Module name should be domain-specific, not generic",
+    "check": "module_name",
+    "forbidden": ["utils", "stuff", "common", "helpers", "shared"],
+    "severity": "warning"
+  },
+  {
+    "id": "entry-count-limit",
+    "rule": "Module should have at most 7 entries",
+    "check": "entry_count",
+    "max_entries": 7,
+    "severity": "warning"
+  }
+]
+`
+		os.WriteFile(convJSON, []byte(tmpl), 0644)
+		result["conventions.json"] = true
+	}
 
 	// Check which files were created
 	for _, name := range []string{"architecture-decisions.md", "lessons-learned.md", "conventions.md"} {
