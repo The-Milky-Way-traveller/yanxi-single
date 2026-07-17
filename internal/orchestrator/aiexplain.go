@@ -77,9 +77,10 @@ func EnsureAIExplain(root string) {
 			docstring := ""
 			lang := "python"
 			if modData != nil { if l, ok := modData["language"].(string); ok && l != "" { lang = l } }
+			var src string
 			if implPath != "" {
 				if data, err := os.ReadFile(implPath); err == nil {
-					src := string(data)
+					src = string(data)
 					docstring = extractModuleDocstring(src, lang)
 					handlerSig = extractHandlerSignature(src, lang)
 				}
@@ -89,13 +90,29 @@ func EnsureAIExplain(root string) {
 			if modData != nil {
 				if desc, ok := modData["description"].(string); ok && desc != "" {
 					md += desc + "\n\n"
+				} else if docstring != "" {
+					md += docstring + "\n\n"
 				} else {
 					md += modName + " module — see interface for details.\n\n"
 				}
 			} else {
 				md += modName + " module — see interface for details.\n\n"
 			}
-			if docstring != "" { md += docstring + "\n\n" }
+			if docstring != "" && modData != nil {
+				if desc, ok := modData["description"].(string); !ok || desc == "" {
+					// docstring already used as purpose
+				} else {
+					md += docstring + "\n\n"
+				}
+			}
+
+			// Dependents info
+			if dependents, ok := depMap[modName]; ok && len(dependents) > 0 {
+				md += fmt.Sprintf("**Depended by**: %s\n\n", strings.Join(dependents, ", "))
+			} else {
+				md += "**Depended by**: none\n\n"
+			}
+
 			md += fmt.Sprintf("## Interface\n\n`%s`\n\n", handlerSig)
 			if modData != nil {
 				if iface, ok := modData["interface"].(map[string]interface{}); ok {
@@ -104,12 +121,20 @@ func EnsureAIExplain(root string) {
 						for entryName, entryRaw := range entries {
 							entryDef, _ := entryRaw.(map[string]interface{})
 							desc := ""
-							if d, ok := entryDef["description"].(string); ok { desc = " — " + d }
-							md += fmt.Sprintf("- **`%s`**%s\n", entryName, desc)
-							if is, ok := entryDef["input_schema"]; ok {
-								ij, _ := json.MarshalIndent(is, "", "  ")
-								md += fmt.Sprintf("  - Input: ```json\n%s\n```\n", string(ij))
+							if d, ok := entryDef["description"].(string); ok && d != "" && !strings.Contains(d, "auto-synced") {
+								desc = d
+							} else {
+								// Try to extract per-entry docstring from source
+								entryDoc := extractEntryDocstring(src, entryName, lang)
+								if entryDoc != "" {
+									desc = entryDoc
+								}
 							}
+							md += fmt.Sprintf("- **`%s`**", entryName)
+							if desc != "" {
+								md += ": " + desc
+							}
+							md += "\n"
 						}
 						md += "\n"
 					} else {
@@ -329,6 +354,38 @@ func extractModuleDocstring(src string, lang string) string {
 		re = regexp.MustCompile(`"""([\\s\\S]*?)"""`)
 	}
 	if m := re.FindStringSubmatch(src); len(m) > 1 { return strings.TrimSpace(m[1]) }
+	return ""
+}
+
+// extractEntryDocstring extracts the comment/docstring immediately before a function definition.
+func extractEntryDocstring(src, entryName, lang string) string {
+	var commentRe *regexp.Regexp
+
+	switch lang {
+	case "go":
+		// Go: single-line // Comment immediately before func
+		commentRe = regexp.MustCompile(`//\s*(.+)\nfunc\s+` + regexp.QuoteMeta(entryName) + `\s*\(`)
+		if m := commentRe.FindStringSubmatch(src); len(m) > 1 {
+			return strings.TrimSpace(m[1])
+		}
+	case "python":
+		// Python: """docstring""" above def entry_name
+		commentRe = regexp.MustCompile(`(?s)"""([^"]*)"""\s*\n(?:async\s+)?def\s+` + regexp.QuoteMeta(entryName) + `\s*\(`)
+		if m := commentRe.FindStringSubmatch(src); len(m) > 1 {
+			return strings.TrimSpace(m[1])
+		}
+		// Also try # comments
+		commentRe = regexp.MustCompile(`(?m)#\s*(.+)\n(?:async\s+)?def\s+` + regexp.QuoteMeta(entryName) + `\s*\(`)
+		if m := commentRe.FindStringSubmatch(src); len(m) > 1 {
+			return strings.TrimSpace(m[1])
+		}
+	case "typescript", "javascript":
+		// TS/JS: /** JSDoc */ above function entryName
+		commentRe = regexp.MustCompile(`(?s)/\*\*([^*]*)\*/\s*\n(?:export\s+)?(?:async\s+)?function\s+` + regexp.QuoteMeta(entryName))
+		if m := commentRe.FindStringSubmatch(src); len(m) > 1 {
+			return strings.TrimSpace(m[1])
+		}
+	}
 	return ""
 }
 
