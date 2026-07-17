@@ -151,13 +151,23 @@ type ImportScanResult struct {
 
 // ScanImports scans ALL imports in a module's source file and classifies them.
 // It returns every known, local, third-party, and stdlib import.
-func ScanImports(root, modName, lang string, src []byte) *ImportScanResult {
+func ScanImports(root, modName, lang string, src []byte, importExtractRegex ...string) *ImportScanResult {
 	r := &ImportScanResult{Module: modName}
 	text := string(src)
 
 	// Step 1: Extract all import strings (language-agnostic form)
 	var rawImports []string
-	switch lang {
+
+	// If custom import regex provided (from LangTemplate), use it
+	if len(importExtractRegex) > 0 && importExtractRegex[0] != "" {
+		customRe := regexp.MustCompile(importExtractRegex[0])
+		for _, m := range customRe.FindAllStringSubmatch(text, -1) {
+			if len(m) > 1 {
+				rawImports = append(rawImports, m[1])
+			}
+		}
+	} else {
+		switch lang {
 	case "go":
 		// Single: import "path"
 		// Group: import ( "path1"\n"path2" )
@@ -196,6 +206,7 @@ func ScanImports(root, modName, lang string, src []byte) *ImportScanResult {
 				rawImports = append(rawImports, strings.SplitN(m[1], " ", 2)[0])
 			}
 		}
+	}
 	}
 
 	// Step 2: Load known yanxi modules

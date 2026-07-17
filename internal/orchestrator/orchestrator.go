@@ -765,12 +765,13 @@ func WireMain(root string, mods []ModuleDiscoverResult) (string, error) {
 
 	var entry string
 	if t.Wire.UseMapPattern {
-		// Go: map-based dispatch
+		// Go: map-based dispatch with HTTP server
 		entry = fmt.Sprintf(`package main
 
 import (
     "encoding/json"
     "fmt"
+    "net/http"
     "os"
 %s
 )
@@ -790,9 +791,28 @@ func run(request map[string]interface{}) map[string]interface{} {
     return map[string]interface{}{"result": nil, "error": map[string]interface{}{"code": "GATEWAY_ROUTE_NOT_FOUND", "message": fmt.Sprintf("Unknown module: %%s", module), "retryable": false, "source_module": "main"}}
 }
 
+func httpHandler(w http.ResponseWriter, r *http.Request) {
+    var request map[string]interface{}
+    if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+        http.Error(w, "invalid JSON body", 400)
+        return
+    }
+    result := run(request)
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(result)
+}
+
 func main() {
+    if len(os.Args) >= 2 && os.Args[1] == "-http" {
+        port := "8080"
+        if len(os.Args) >= 3 { port = os.Args[2] }
+        http.HandleFunc("/api/", httpHandler)
+        fmt.Println("Listening on :" + port)
+        http.ListenAndServe(":"+port, nil)
+        return
+    }
     if len(os.Args) < 2 {
-        data, _ := json.MarshalIndent(map[string]interface{}{"result": nil, "error": map[string]interface{}{"code": "GATEWAY_ROUTE_NOT_FOUND", "message": "Usage: main <module>"}}, "", "  ")
+        data, _ := json.MarshalIndent(map[string]interface{}{"result": nil, "error": map[string]interface{}{"code": "GATEWAY_ROUTE_NOT_FOUND", "message": "Usage: main <module> or main -http [port]"}}, "", "  ")
         fmt.Println(string(data))
         os.Exit(1)
     }
@@ -1027,4 +1047,92 @@ func BootstrapModule(root, name, language, description string) *BootstrapResult 
 		r.Synced = true
 	}
 	return r
+}
+
+// BuildReport generates a project-level health report.
+func BuildReport(root string) map[string]interface{} {
+	ov := ModuleDiscover(root)
+	vs := loadValidationState(root)
+
+	report := map[string]interface{}{
+		"project":       filepath.Base(root),
+		"module_count":  ov.ModuleCount,
+		"language":      ov.PrimaryLanguage,
+		"has_memory":    ov.HasProjectMemory,
+		"has_aiexplain": ov.HasAIExplain,
+		"circular_deps": len(ov.CircularDeps),
+	}
+
+	type moduleInfo struct {
+		Name       string   `json:"name"`
+		Status     string   `json:"status"`
+		Dependents int      `json:"dependents"`
+		Valid      string   `json:"valid"`
+		EntryCount int      `json:"entries"`
+		Warnings   []string `json:"warnings,omitempty"`
+	}
+	var modules []moduleInfo
+	unvalidated := 0
+	failed := 0
+	deprecated := 0
+	for _, m := range ov.Modules {
+		info := moduleInfo{
+			Name:       m.Name,
+			Status:     m.Status,
+			Dependents: len(m.DependedBy),
+			EntryCount: len(entryNames(m.Interface)),
+		}
+		if state, ok := vs.Modules[m.Name]; ok {
+			if state.Valid {
+				info.Valid = "valid"
+			} else {
+				info.Valid = "failed"
+				failed++
+			}
+		} else {
+			info.Valid = "unvalidated"
+			unvalidated++
+		}
+		if m.Status == "deprecated" || m.Status == "archived" {
+			deprecated++
+		}
+		if len(m.DependedBy) == 0 && m.Status != "deprecated" && m.Status != "archived" {
+			info.Warnings = append(info.Warnings, "no dependents — may be dead code")
+		}
+		if len(entryNames(m.Interface)) > 7 {
+			info.Warnings = append(info.Warnings, fmt.Sprintf("%d entries, consider splitting", len(entryNames(m.Interface))))
+		}
+		modules = append(modules, info)
+	}
+	report["modules"] = modules
+	report["unvalidated"] = unvalidated
+	report["failed"] = failed
+	report["deprecated"] = deprecated
+
+	// Risk score
+	risk := 0
+	if ov.ModuleCount > 0 {
+		risk = int(float64(unvalidated)/float64(ov.ModuleCount)*30 +
+			float64(failed)/float64(ov.ModuleCount)*50 +
+			float64(deprecated)*5)
+		if risk > 100 {
+			risk = 100
+		}
+	}
+	report["risk_score"] = risk
+
+	// Core modules
+	type coreInfo struct {
+		Name       string `json:"name"`
+		Dependents int    `json:"dependents"`
+	}
+	var coreModules []coreInfo
+	for _, m := range modules {
+		if m.Dependents >= 2 {
+			coreModules = append(coreModules, coreInfo{Name: m.Name, Dependents: m.Dependents})
+		}
+	}
+	report["core_modules"] = coreModules
+
+	return report
 }

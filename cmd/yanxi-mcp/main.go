@@ -313,6 +313,26 @@ func main() {
 		},
 	)
 
+	srv.RegisterTool("module_sync", "Apply pending changes to a module: sync entries, calls, and version from source code.",
+		mcp.ToolSchema{Type: "object", Properties: map[string]mcp.PropertySpec{
+			"module":     {Type: "string", Description: "Module name", Required: true},
+			"project_dir": {Type: "string", Description: "Project root"},
+		}, Required: []string{"module"}},
+		func(args map[string]interface{}) (interface{}, error) {
+			modName, _ := args["module"].(string)
+			if modName == "" { return nil, fmt.Errorf("module required") }
+			projectDir, _ := args["project_dir"].(string)
+			if projectDir == "" { projectDir = "." }
+			result := validate.ModuleSync(projectDir, modName)
+			ns := "Sync complete."
+			if err, ok := result["error"].(string); ok && err != "" {
+				ns = "Sync failed: " + err
+			}
+			result["next_step"] = ns
+			return result, nil
+		},
+	)
+
 	srv.RegisterTool("module_deprecate", "Mark a module as deprecated or archived. Records an ADR and warns dependents.",
 		mcp.ToolSchema{Type: "object", Properties: map[string]mcp.PropertySpec{
 			"module":     {Type: "string", Description: "Module name", Required: true},
@@ -403,7 +423,20 @@ func main() {
 		},
 	)
 
-	log.Println("Yanxi MCP v1.0.0 (16 tools: discover/create/aiexplain/validate/wire/search/loose_search/check_imports/bootstrap/save_lang_template/module_read/memory_init/memory_write/adopt/adopt_commit/deprecate + schema diff/strict/deep/streaming/middleware/cross-module/external-import-scan/deprecation-warning/lesson-dedup/discover-cache)")
+	srv.RegisterTool("module_report", "Generate a project-level health report: heatmap, risk score, core modules.",
+		mcp.ToolSchema{Type: "object", Properties: map[string]mcp.PropertySpec{
+			"project_dir": {Type: "string", Description: "Project root"},
+		}},
+		func(args map[string]interface{}) (interface{}, error) {
+			projectDir, _ := args["project_dir"].(string)
+			if projectDir == "" { projectDir = "." }
+			report := orchestrator.BuildReport(projectDir)
+			report["next_step"] = "Review the report and address warnings."
+			return report, nil
+		},
+	)
+
+	log.Println("Yanxi MCP v1.1.0 (18 tools: discover/create/aiexplain/validate/wire/search/loose_search/check_imports/bootstrap/save_lang_template/module_read/memory_init/memory_write/adopt/adopt_commit/deprecate/sync/report + schema diff/strict/deep/streaming/middleware/cross-module/external-import-scan/deprecation-warning/lesson-dedup/discover-cache/granularity/conventions/http-server)")
 	srv.ListenStdio()
 }
 

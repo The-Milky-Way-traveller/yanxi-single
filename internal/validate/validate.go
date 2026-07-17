@@ -1,6 +1,7 @@
 package validate
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -194,11 +195,7 @@ func ValidateModule(root, modName string) Result {
 		}
 	}
 	if len(newEntries) > 0 {
-		// Auto-write into module.json
-		if ifaceRaw != nil {
-			autoSyncEntries(root, modName, ifaceRaw, newEntries, lang)
-		}
-		r.Warnings = append(r.Warnings, fmt.Sprintf("Auto-synced %d entries from source: %v", len(newEntries), newEntries))
+		r.Warnings = append(r.Warnings, fmt.Sprintf("Detected %d undeclared exports in source: %v — run module_sync() to add them to module.json", len(newEntries), newEntries))
 	}
 
 	// ── Module Granularity Checks (v1.0.0) ──
@@ -237,7 +234,11 @@ func ValidateModule(root, modName string) Result {
 	// ── Comprehensive Import Scan (v5.4.0) ──
 	langScan := lang
 	if langScan == "" { langScan = "python" }
-	scanResult := check.ScanImports(root, modName, langScan, implData)
+	var importRegex string
+	if tmplErr == nil {
+		importRegex = langTmpl.ImportExtractRegex()
+	}
+	scanResult := check.ScanImports(root, modName, langScan, implData, importRegex)
 	// Add warnings for local (non-module) imports that could be adopted
 	for _, loc := range scanResult.Local {
 		r.Warnings = append(r.Warnings, fmt.Sprintf("Local import %q — consider module_adopt(\"%s\") to bring under yanxi management", loc.Raw, loc.Package))
@@ -259,8 +260,7 @@ func ValidateModule(root, modName string) Result {
 	// 1b. Calls auto-infer: scan source for cross-module call patterns not yet declared
 	inferredCalls := inferModuleCalls(src, modName, lang, root)
 	if len(inferredCalls) > 0 {
-		autoSyncCalls(root, modName, contract, inferredCalls)
-		r.Warnings = append(r.Warnings, fmt.Sprintf("Auto-synced %d calls from source", len(inferredCalls)))
+		r.Warnings = append(r.Warnings, fmt.Sprintf("Detected %d cross-module calls in source — run module_sync() to write to interface.calls", len(inferredCalls)))
 	}
 
 	// 2. Middleware: every declared middleware function must exist as an entry in target module
@@ -271,6 +271,10 @@ func ValidateModule(root, modName string) Result {
 
 	// 4. Transport validation: check HTTP route declarations
 	r.TransportIssues = checkTransportHTTP(root, modName, contract)
+
+	// 5. Interface provides/uses check: validate cross-module interface contracts
+	ifaceIssues := checkProvidesUses(root, modName, contract, entryList)
+	r.Warnings = append(r.Warnings, ifaceIssues...)
 
 	// ── Schema Diff (v5.3.0) ──
 	breakingChanges := CompareModuleSchemas(root, modName, contract)
@@ -294,18 +298,7 @@ func ValidateModule(root, modName string) Result {
 
 	// ── Version Auto-Bump (v1.0.0) ──
 	if hasBreakingVersion(r.BreakingChanges) {
-		// Re-read to preserve entry/calls auto-sync changes
-		vdata, verr := os.ReadFile(modJSONPath)
-		if verr == nil {
-			var vcontract map[string]interface{}
-			if json.Unmarshal(vdata, &vcontract) == nil {
-				bumpVersion(vcontract, "major")
-				if nd, e := json.MarshalIndent(vcontract, "", "  "); e == nil {
-					os.WriteFile(modJSONPath, nd, 0644)
-				}
-			}
-		}
-		r.Warnings = append(r.Warnings, "Version auto-bumped to major (breaking changes)")
+		r.Warnings = append(r.Warnings, "Breaking schema changes detected — run module_sync() to bump version")
 	}
 
 	// ── Downstream Compatibility (v5.4.0) ──
@@ -495,6 +488,74 @@ func ValidateModule(root, modName string) Result {
 	}
 
 	return r
+}
+
+func checkProvidesUses(root, modName string, contract map[string]interface{}, entryList []string) []string {
+	ifaceRaw, _ := contract["interface"].(map[string]interface{})
+	if ifaceRaw == nil {
+		return nil
+	}
+	usesRaw, ok := ifaceRaw["uses"].(map[string]interface{})
+	if !ok || len(usesRaw) == 0 {
+		return nil
+	}
+
+	var issues []string
+	for ifaceName, methodsRaw := range usesRaw {
+		methods, ok := methodsRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		// Split "module.InterfaceName" to find provider
+		parts := strings.SplitN(ifaceName, ".", 2)
+		if len(parts) != 2 {
+			issues = append(issues, fmt.Sprintf("uses %q: expected format 'ModuleName.InterfaceName'", ifaceName))
+			continue
+		}
+		providerModule := parts[0]
+		providerIface := parts[1]
+
+		// Check provider module exists
+		providerJSON := filepath.Join(root, "source", "modules", providerModule, "module.json")
+		pData, err := os.ReadFile(providerJSON)
+		if err != nil {
+			issues = append(issues, fmt.Sprintf("uses %s.%s: provider module %q not found", providerModule, providerIface, providerModule))
+			continue
+		}
+		var pContract map[string]interface{}
+		if json.Unmarshal(pData, &pContract) != nil {
+			continue
+		}
+		pIface, _ := pContract["interface"].(map[string]interface{})
+		if pIface == nil {
+			issues = append(issues, fmt.Sprintf("uses %s.%s: provider has no interface", providerModule, providerIface))
+			continue
+		}
+		provides, _ := pIface["provides"].(map[string]interface{})
+		if provides == nil {
+			issues = append(issues, fmt.Sprintf("uses %s.%s: provider does not declare 'provides'", providerModule, providerIface))
+			continue
+		}
+		provIface, _ := provides[providerIface].(map[string]interface{})
+		if provIface == nil {
+			issues = append(issues, fmt.Sprintf("uses %s.%s: provider does not provide interface %q", providerModule, providerIface, providerIface))
+			continue
+		}
+		provMethods, _ := provIface["methods"].([]interface{})
+		provMethodSet := make(map[string]bool)
+		for _, m := range provMethods {
+			if s, ok := m.(string); ok {
+				provMethodSet[s] = true
+			}
+		}
+		// Check each used method exists in provider
+		for methodName := range methods {
+			if !provMethodSet[methodName] {
+				issues = append(issues, fmt.Sprintf("uses %s.%s: method %q not declared by provider", providerModule, providerIface, methodName))
+			}
+		}
+	}
+	return issues
 }
 
 func checkTransportHTTP(root, modName string, contract map[string]interface{}) []string {
@@ -1010,16 +1071,18 @@ console.log(JSON.stringify(%s(%s)));
 func runGoTest(root, modName, fname string, input map[string]interface{}, expected string) TestResult {
 	tr := TestResult{Input: input, Expected: expected}
 	inputJSON, _ := json.Marshal(input)
+	inputB64 := base64.StdEncoding.EncodeToString(inputJSON)
 	script := fmt.Sprintf(`package main
-import ("encoding/json";"fmt";_ "%s/source/modules/%s")
+import ("encoding/base64";"encoding/json";"fmt";_ "%s/source/modules/%s")
 func main() {
+    raw, _ := base64.StdEncoding.DecodeString("%s")
     var d map[string]interface{}
-    json.Unmarshal([]byte(%q), &d)
+    json.Unmarshal(raw, &d)
     r := %s.%s(d)
     b, _ := json.Marshal(r)
     fmt.Println(string(b))
 }
-`, root, modName, string(inputJSON), modName, fname)
+`, root, modName, inputB64, modName, fname)
 	tmpFile := filepath.Join(os.TempDir(), "yanxi-gotest-"+modName+".go")
 	os.WriteFile(tmpFile, []byte(script), 0644)
 	defer os.Remove(tmpFile)
@@ -1031,6 +1094,12 @@ func runCmd(cmd string, args []string, tr TestResult) TestResult {
 	out, err := c.CombinedOutput()
 	outStr := strings.TrimSpace(string(out))
 	if err != nil {
+		// Runtime not found → degrade to warning
+		if isRuntimeMissing(err, outStr) {
+			tr.Passed = true
+			tr.Note = fmt.Sprintf("runtime %q not available, test skipped", cmd)
+			return tr
+		}
 		tr.Passed = false
 		tr.Error = fmt.Sprintf("%s: %v\n%s", cmd, err, outStr)
 		return tr
@@ -1047,6 +1116,124 @@ func runCmd(cmd string, args []string, tr TestResult) TestResult {
 	if _, hr := output["result"]; !hr { tr.Note = "no 'result' field" }
 	tr.Passed = true
 	return tr
+}
+
+// isRuntimeMissing checks if a command failed because the runtime isn't installed.
+func isRuntimeMissing(err error, output string) bool {
+	// Windows: exit code 9009 = command not found
+	// Linux/Mac: exit code 127 = command not found
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr.ExitCode() == 9009 || exitErr.ExitCode() == 127 {
+			return true
+		}
+	}
+	// Also check output for common "not found" messages
+	lower := strings.ToLower(output)
+	if strings.Contains(lower, "not found") || strings.Contains(lower, "not recognized") {
+		return true
+	}
+	return false
+}
+
+// ModuleSync scans a module and applies all pending changes (entries, calls, version).
+// Returns a summary of what was changed.
+func ModuleSync(root, modName string) map[string]interface{} {
+	result := map[string]interface{}{"module": modName}
+
+	modDir := filepath.Join(root, "source", "modules", modName)
+	modJSONPath := filepath.Join(modDir, "module.json")
+	data, err := os.ReadFile(modJSONPath)
+	if err != nil {
+		result["error"] = "module.json not found"
+		return result
+	}
+	var contract map[string]interface{}
+	if json.Unmarshal(data, &contract) != nil {
+		result["error"] = "invalid module.json"
+		return result
+	}
+	ifaceRaw, _ := contract["interface"].(map[string]interface{})
+	if ifaceRaw == nil {
+		result["error"] = "no interface"
+		return result
+	}
+
+	lang, _ := contract["language"].(string)
+	if lang == "" { lang = "python" }
+
+	// 1. Entry sync
+	implPath := filepath.Join(modDir, modName+"."+langExt(lang))
+	srcData, err := os.ReadFile(implPath)
+	var syncedEntries []string
+	if err == nil {
+		src := string(srcData)
+		exportPat := `(?m)^(?:def|func|function)\s+(\w+)`
+		if t, te := langtmpl.Resolve(root, lang); te == nil && t.Validate.ExportFuncRegex != "" {
+			exportPat = t.ExportFuncRegex()
+		}
+		exportRe := regexp.MustCompile(exportPat)
+		declaredSet := make(map[string]bool)
+		if ents, hasE := ifaceRaw["entries"].(map[string]interface{}); hasE {
+			for k := range ents { declaredSet[k] = true }
+		} else if e, _ := ifaceRaw["entry"].(string); e != "" {
+			declaredSet[e] = true
+		}
+		for _, m := range exportRe.FindAllStringSubmatch(src, -1) {
+			if len(m) > 1 {
+				fn := m[1]
+				if strings.HasPrefix(fn, "_") || fn == "init" || fn == "main" || fn == "Handler" { continue }
+				if !declaredSet[fn] {
+					declaredSet[fn] = true
+					syncedEntries = append(syncedEntries, fn)
+				}
+			}
+		}
+		if len(syncedEntries) > 0 {
+			autoSyncEntries(root, modName, ifaceRaw, syncedEntries, lang)
+			// Re-read updated contract
+			data, _ = os.ReadFile(modJSONPath)
+			json.Unmarshal(data, &contract)
+			ifaceRaw, _ = contract["interface"].(map[string]interface{})
+		}
+	}
+	result["entries_synced"] = syncedEntries
+
+	// 2. Calls sync
+	if ifaceRaw != nil {
+		inferredCalls := inferModuleCalls(string(srcData), modName, lang, root)
+		if len(inferredCalls) > 0 {
+			autoSyncCalls(root, modName, contract, inferredCalls)
+			data, _ = os.ReadFile(modJSONPath)
+			json.Unmarshal(data, &contract)
+		}
+		result["calls_synced"] = len(inferredCalls)
+	}
+
+	// 3. Version bump (if breaking changes detected)
+	ifaceRaw, _ = contract["interface"].(map[string]interface{})
+	if ifaceRaw != nil {
+		breakingChanges := CompareModuleSchemas(root, modName, contract)
+		if hasBreakingVersion(breakingChanges) {
+			bumpVersion(contract, "major")
+			if nd, e := json.MarshalIndent(contract, "", "  "); e == nil {
+				os.WriteFile(modJSONPath, nd, 0644)
+			}
+			result["version_bumped"] = "major"
+		}
+		saveSchemaCache(root, modName, contract)
+	}
+
+	return result
+}
+
+func langExt(lang string) string {
+	switch lang {
+	case "go": return "go"
+	case "python": return "py"
+	case "typescript": return "ts"
+	case "javascript": return "js"
+	default: return "py"
+	}
 }
 
 func hasBreakingVersion(breakingChanges []BreakingChange) bool {

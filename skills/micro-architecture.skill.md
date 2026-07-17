@@ -3,321 +3,281 @@ name: micro-architecture
 description: >
   Micro-module architecture conventions for Yanxi projects.
   Teaches agents how to discover, understand, modify, and
-  document modules in a source/modules/ + AIexplain/ project.
+  document modules using the Yanxi MCP toolset.
 runAs: inline
 ---
 
-# Micro-Module Architecture Guide
+# Yanxi Micro-Module Architecture Guide
 
-This project follows the **micro-module architecture**. Every module is an independent unit
-with a strict contract, structured for agent understanding.
+## What is Yanxi?
+
+Yanxi is a set of MCP tools (this project's `yanxi-mcp.exe`) that help AI agents
+navigate and maintain structured codebases. It does three things:
+
+1. **Map** — understand the project in ~500 tokens via `module_discover()`
+2. **Check** — validate modules automatically via `module_validate()`
+3. **Remember** — persist lessons across sessions via `project-memory/`
+
+### Yanxi's Boundary
+
+Yanxi follows a strict rule:
+
+```
+Yanxi suggests → Agent decides → User confirms
+```
+
+- Yanxi detects issues and reports them as warnings
+- Yanxi **never** modifies your code or contracts without explicit agent action
+- When yanxi finds something (undeclared entries, mismatched imports, broken calls),
+  it tells you. You decide whether to act.
+- When yanxi's finding affects the user's project, **tell the user what yanxi found
+  and ask for their decision**.
+
+---
+
+## 17 MCP Tools
+
+| Tool | Purpose |
+|------|---------|
+| `module_discover` | Enter project: Level 1 (summary) + Level 2 (module digest) |
+| `module_create` | Scaffold a new module skeleton |
+| `module_read` | Full module details: contract + AIexplain + source preview |
+| `module_validate` | 6-stage validation pipeline — see below |
+| `module_wire` | Generate main entry routing code |
+| `module_bootstrap` | One-shot: create + wire + sync |
+| `module_search` | BM25/vector search across AIexplain + source |
+| `module_search_loose` | Search any directory, no architecture required |
+| `module_check_imports` | Verify declared vs actual imports |
+| `module_adopt` | Analyse external code for adoption as a yanxi module |
+| `module_adopt_commit` | Finalise adoption: write + delete original + wire + sync |
+| `module_deprecate` | Mark module as deprecated/archived + write ADR |
+| `module_sync` | Apply pending changes: sync entries, calls, version from source |
+| `save_lang_template` | Save an LLM-generated language template |
+| `aiexplain_generate` | Incrementally regenerate AIexplain cards + search index |
+| `memory_init` | Create project-memory + config templates (idempotent) |
+| `memory_write` | Write ADR/lesson/convention to project memory |
+
+---
+
+## Standard Workflow
+
+### Entering a project
+```
+module_discover() — one call, full picture (~500 tokens)
+```
+Always call this first. It returns:
+- Project summary + warnings
+- Module list with dependency graph
+- Any deprecated modules (shown with ⚠)
+- Any dependent modules that will break
+
+### Understanding a module
+```
+module_read("module_name") — full contract + AIexplain + source preview
+```
+Read the AIexplain card before touching source code. Only read source when
+you are about to modify it.
+
+### The Five-Step Modification Loop
+```
+① module_discover()          → understand current state
+② module_read("module")      → understand the module
+③ edit source code           → change handler logic
+④ module_validate("module")  → check everything
+⑤ module_wire() + aiexplain_generate() → sync
+```
+
+**When module_validate reports issues**:
+```
+validate found errors     → Agent reads errors → fixes source → re-runs validate
+validate found warnings   → Agent reads warnings → decides whether to act
+validate suggests changes → Agent runs module_sync() to apply them
+```
+
+### Adding a new module
+```
+module_create("name", language="go") → write handler → module_validate → module_wire
+```
+
+### Adopting external code
+```
+module_adopt("pkg/util")  → reads the prompt → LLM adapts → module_adopt_commit()
+```
+
+### Deprecating an old module
+```
+module_deprecate("old_mod", "deprecated", "replaced by new_mod")
+→ ADR written automatically, dependents warned
+```
+
+---
+
+## Validation (6 Stages)
+
+`module_validate("module")` runs six stages in order:
+
+1. **Structure** — module.json exists, required fields present, entry declared
+2. **Source** — entry function exists in source, lifecycle hooks exist
+3. **Cross-module** — calls target real module+entry, middleware exists,
+   no deprecated dependencies, downstream compatibility
+4. **Deep analysis** — import classification (known/local/3rd-party/stdlib),
+   side effects, streaming patterns
+5. **Runtime** — auto-generates test cases from schema, runs them,
+   measures latency, checks strict mode
+6. **Diff** — compares current schema against previous, detects breaking changes,
+   suggests version bump
+
+**When tests fail**: read the error output, fix the source code, re-run validate.
+Tests that fail because of missing runtimes (e.g., Python not installed) are
+warnings, not failures.
+
+### What Yanxi Detects and Suggests
+
+| Detection | Yanxi does | You do |
+|-----------|-----------|--------|
+| Undeclared exports in source | Warning with function list | `module_sync()` to add as entries |
+| Cross-module calls in source | Warning with count | `module_sync()` to write to calls |
+| Breaking schema changes | Warning | `module_sync()` to bump version |
+| Import mismatch | Error with details | Fix module.json dependencies |
+| Deprecated upstream | Warning | Plan migration to replacement |
+| Vague module name | Warning | Rename to domain-specific name |
+| Too many entries (>7) | Warning | Split into smaller modules |
+
+---
 
 ## Project Anatomy
 
 ```
 <project>/
+├── .yanxi/                        ← tool state (auto-managed)
+│   ├── project.json
+│   ├── discover_cache.json
+│   ├── schema_cache/<module>.json
+│   ├── validation_state.json
+│   ├── last_sync.json
+│   ├── search_index.json
+│   └── lang-templates/<lang>.json
 ├── source/
-│   ├── main/                    ← entry point wiring
-│   │   ├── main.py              ← routes to modules
-│   │   └── shared_functions.py  ← shared utilities
-│   ├── modules/<name>/          ← each module lives here
-│   │   ├── <name>.<ext>         ← implementation (py/ts/js/go)
-│   │   └── module.json          ← interface contract
-│   └── ui/                      ← (optional) UI layer
-├── AIexplain/                   ← AGENT'S KNOWLEDGE LAYER
-│   ├── project-architecture.md  ← global architecture overview
-│   ├── module-contracts.json    ← all module contracts in one file
-│   ├── shared-functions-guide.md
+│   ├── main/main.{py|ts|go}      ← wired entry point (module_wire generates)
 │   └── modules/<name>/
-│       ├── <name>.md            ← skill card (purpose + interface + usage)
-│       └── interface.md         ← API reference
-├── project-memory/              ← PROJECT'S COLLECTIVE MEMORY
-│   ├── architecture-decisions.md ← ADRs (why decisions were made)
-│   ├── lessons-learned.md       ← pitfalls encountered + solutions
-│   └── conventions.md           ← coding conventions for this project
-├── INDEX.md                     ← human-readable registry
-└── agent-config.json            ← agent model routing (optional)
+│       ├── <name>.{py|ts|go}     ← handler logic
+│       └── module.json           ← contract + schema
+├── AIexplain/                     ← agent-readable knowledge (auto-generated)
+│   ├── project-architecture.md
+│   ├── module-contracts.json
+│   └── modules/<name>/
+│       ├── <name>.md
+│       └── interface.md
+├── project-memory/                ← collective memory
+│   ├── architecture-decisions.md
+│   ├── lessons-learned.md
+│   ├── conventions.md
+│   └── conventions.json           ← structured rules (validated automatically)
+├── INDEX.md
+└── .mcp.json
 ```
 
-## CRITICAL RULES
+---
 
-### Rule 1: AIexplain First, Source Only When Modifying
+## Interface Contract
 
-**ALWAYS read AIexplain before source code.**
-
-When you enter a project, your first action MUST be:
-```
-module_discover(project_dir=".")
-```
-
-This returns all modules with their AIexplain skill cards embedded. You understand
-the entire project in one call without reading individual source files.
-
-When you need to understand a specific module:
-1. Read `AIexplain/modules/<name>/<name>.md` — purpose + interface + usage
-2. Read `AIexplain/modules/<name>/interface.md` — API reference
-3. **Only read `source/modules/<name>/<name>.<ext>` if you are about to modify it**
-
-### Rule 2: Create Modules the Right Way
-
-When adding a new module, use `module_create` to scaffold the skeleton:
-```
-module_create(name="auth", language="python", description="JWT authentication")
+Every module exposes:
+```python
+def handler(input: dict) -> dict:
+    ...
 ```
 
-This generates a compliant skeleton:
-- `source/modules/auth/auth.py` with `handler(input: dict) -> dict` stub
-- `source/modules/auth/module.json` with full interface contract
-
-After scaffolding, fill in the handler implementation. Then sync the knowledge layer.
-
-### Rule 3: Always Sync AIexplain After Changes
-
-After ANY modification to module source code:
-- Calling `aiexplain_generate()` regenerates all AIexplain documents
-- This ensures the next agent (or you next session) reads correct information
-- The skill cards are your gift to your future self
-
-The sync is automatic — one tool call, all documents updated:
-```
-aiexplain_generate(project_dir=".")
-```
-
-### Rule 4: The Four-Step Modification Loop
-
-```
-① module_discover()           → understand the project (one call)
-② read AIexplain/<name>.md    → understand the target module
-③ edit source + module.json   → change the code, bump version
-④ aiexplain_generate()        → sync the knowledge layer
+Enforced by `module.json`:
+```json
+{
+  "name": "auth",
+  "version": "1.0.0",
+  "status": "active",
+  "language": "go",
+  "dependencies": ["storage"],
+  "interface": {
+    "entries": {
+      "login": {
+        "input_schema": { "type": "object", "required": ["username", "password"], ... },
+        "output_schema": { "type": "object", ... }
+      }
+    },
+    "calls": {
+      "storage": { "save_session": {} }
+    }
+  }
+}
 ```
 
-### Rule 5: Always Write to Project Memory
+---
 
-After significant actions, write to `project-memory/` so the next agent benefits:
+## Module Boundary Rules
 
-| File | When to write | Content |
-|------|--------------|---------|
-| `architecture-decisions.md` | After any architectural decision | ADR-NNN: What you decided, why, what alternatives you considered |
-| `lessons-learned.md` | After encountering and solving a problem | Date, problem description, root cause, solution, prevention |
-| `conventions.md` | When establishing project-level conventions | The convention and the reasoning behind it |
+When deciding whether to create a new module, ask:
 
-When entering a project, `module_discover()` returns these files' content in the
-`project_memory` field. **Read them before anything else** — they contain hard-won
-knowledge that you should not rediscover.
+1. **Data ownership** — does this function own data no other module owns? → new module
+2. **Change isolation** — will this function change independently? → new module
+3. **External dependency** — does it wrap a DB/API/filesystem? → new module
+4. **Testability** — can it be validated standalone? → good candidate
 
-### Rule 6: Standard Error Format
+**Anti-patterns**: one function per module (too fine), utils/common helpers (dumpster),
+circular dependencies, names tied to implementation details.
 
-All handler responses with errors MUST use this format:
+---
+
+## Architecture Planning
+
+When a request involves **2+ modules**, stop and show a plan:
+
+```
+module_discover() — understand current state
+Draft plan → present to user → [Approve] [Modify] [Reject]
+```
+
+Only proceed after user approval. Use sub-agents via `task()` for independent modules.
+
+---
+
+## Error Format
+
+All handler responses with errors:
 ```json
 {
   "result": null,
   "error": {
-    "code": "\u003cMODULE\u003e_\u003cERROR_TYPE\u003e",
-    "message": "Human-readable description",
+    "code": "MODULE_ERROR_TYPE",
+    "message": "Human-readable",
     "retryable": true,
-    "source_module": "\u003cname\u003e"
+    "source_module": "name"
   }
 }
 ```
 
-Error codes follow `\u003cMODULE\u003e_\u003cERROR_TYPE\u003e` pattern:
-- `AUTH_TOKEN_EXPIRED`, `AUTH_CREDENTIALS_WRONG`
-- `STORAGE_QUERY_FAILED`, `STORAGE_CONNECTION_FAILED`
-- `GATEWAY_ROUTE_NOT_FOUND`, `GATEWAY_MODULE_UNAVAILABLE`
+---
 
-If `retryable` is true, the caller should retry with backoff.
+## Project Memory
 
-### Rule 6.5: Show Architecture Plan Before Building
+After significant actions, write to project-memory:
+- `architecture-decisions.md` — architectural decisions with rationale
+- `lessons-learned.md` — pitfalls + solutions (yanxi auto-writes on validate failure)
+- `conventions.md` — project conventions
+- `conventions.json` — structured rules validated automatically
 
-When a user request involves **2+ modules** or any architectural decision (e.g., "make a todo API with auth, SQLite storage, CRUD"):
+Use `memory_write(kind="lesson", content="...")` to add entries.
+Use `memory_init()` to create missing templates.
 
-**Stop. Show a plan first. Get approval. Then build.**
+---
 
-1. `module_discover()` — understand the current project state
-2. Draft an architecture plan: which modules, what language, why, dependency order
-3. Present it to the user with three options: **[Approve] [Modify] [Reject]**
-4. If "Modify" → incorporate feedback, re-present
-5. Only after user approves → proceed to Rule 7 (or build it yourself if ≤1 module)
+## Summary
 
 ```
-# Your architecture draft:
-├── 📦 auth (Python, JWT-based)
-│   └── 接口: register(), login(), verify_token()
-├── 📦 storage (Go, SQLite, high-concurrency)
-│   └── 接口: query(), execute(), migrate()
-├── 📦 todo (Python, CRUD) — depends on auth + storage
-└── 📦 gateway (TypeScript, Express) — depends on all above
-
-📌 Notes:
-- storage in Go because the project has concurrent writes
-- auth depends on storage's users table → storage first
-- Estimated: 3 sub-agents, ~30s
-
-[Approve]  [Modify]  [Reject]
+Enter project   → module_discover()
+Understand      → module_read("name")
+Create          → module_create("name", language="go")
+Modify          → edit → validate → sync → wire
+Adopt legacy    → module_adopt → LLM → module_adopt_commit
+Retire          → module_deprecate("name", "deprecated", reason)
+Sync changes    → module_sync("name")
+Check           → module_validate("name")
+Report findings → tell the user what yanxi found, let them decide
 ```
-
-`ponytail:` Natural language draft is enough. No structured plan schema, no JSON — user reads it, says yes or no. Add validation when the team finds people approving plans they didn't read.
-
-### Rule 7: Decompose Complex Requests — Use Sub-Agents
-
-When a user request involves **2+ modules** (e.g., "add auth + storage + todo CRUD"):
-
-**You are the orchestrator — do not write every module yourself.**
-
-1. `module_discover()` — understand the full project + dependency graph
-2. Identify which modules to create/modify, group by dependency order
-3. Delegate each module to a sub-agent via `task()`:
-   - Sub-agent scope: read AIexplain → edit handler → bump version in module.json
-   - Independent modules run in parallel; dependent ones wait for their prereqs
-4. Wait for all sub-agents to complete
-5. `module_wire()` — regenerate the main entry point
-6. `aiexplain_generate()` — sync the knowledge layer
-7. Write to `project-memory/architecture-decisions.md` documenting what was done
-
-```
-# You are the orchestrator:
-modules = ["auth", "storage", "todo"]  # from module_discover
-parallel tasks: auth, storage           # no deps, run together
-serial task: todo                       # depends on auth + storage
-task("build auth") → task("build storage")  # parallel
-task("build todo")                          # after both done
-module_wire()
-aiexplain_generate()
-```
-
-`ponytail:` No orchestrator framework needed here. A flat list of `task()` calls + one `WaitForAll()` covers everything. Reach for a scheduler only when you have 5+ concurrent sub-agents or a genuinely deep dependency tree.
-
-## Interface Contract
-
-Every module exposes a single entry point:
-```python
-def handler(input: dict) -> dict:
-    """
-    Args:
-        input: dict with module-specific parameters
-    Returns:
-        {"result": <any>, "error": <string|null>}
-    """
-```
-
-The contract is enforced by `module.json`:
-```json
-{
-  "name": "calculator",
-  "version": "1.2.0",
-  "status": "stable",
-  "interface": {
-    "entry": "handler",
-    "input_schema": { "type": "object", ... },
-    "output_schema": { "type": "object", ... }
-  }
-}
-```
-
-## Module Boundary Rules (for decomposition)
-
-When deciding whether to create a new module, ask:
-
-1. **Data ownership**: Does this function own data that no other module owns?
-   → Yes: new module.
-2. **Change isolation**: Will this function change independently of others?
-   → Yes: new module.
-3. **External dependency**: Does this function wrap an external system (DB, API, filesystem)?
-   → Yes: new module — isolate the dependency.
-4. **Testability**: Can this function be validated standalone?
-   → Yes: good candidate for a module.
-
-If NONE of the above apply → merge into an existing module.
-
-### Anti-patterns to avoid
-- One function per module (too fine-grained)
-- utils/helpers/common modules (dumpster drawers)
-- Circular dependencies (merge or introduce a shared interface)
-- Module names tied to implementation details (e.g. "sqlite-storage")
-
-## Module Communication Rules
-
-### Importing another module
-
-When module A depends on module B:
-
-1. **Declare** the dependency in module.json:
-   ```json
-   { "dependencies": ["B"] }
-   ```
-2. **Import** B's handler at the top of A's implementation, using the full package path:
-   ```python
-   import sys, json
-   from pathlib import Path
-   PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-   sys.path.insert(0, str(PROJECT_ROOT))
-   from source.modules.B.B import handler as handler_B
-   ```
-3. **Call** B through its handler contract:
-   ```python
-   result = handler_B({"action": "...", ...})
-   if result.get("error"):
-       return result  # bubble the error
-   ```
-4. **Verify** consistency after modifying A's code:
-   ```
-   module_check_imports(module="A")
-   ```
-   This checks that declared dependencies match actual imports.
-
-### Do NOT import without declaring
-
-If your code imports another module but module.json does not list it
-as a dependency, `module_check_imports` will flag it as undeclared.
-If module.json declares a dependency that is never imported,
-it will be flagged as unused.
-
-## INDEX.md
-
-After adding/removing modules, update INDEX.md. It's a markdown table:
-```markdown
-| Module | Version | Status | Owner | Language | Interface |
-|--------|---------|--------|-------|----------|-----------|
-| auth   | 1.0.0   | stable | agent | python   | handler(input) -> dict |
-```
-
-## Legacy Project Adoption
-
-For projects NOT yet using micro-module architecture:
-
-### Strategy A: Zero-intrusion search
-```
-module_search_loose(query="<concept>", project_dir="<path>")
-```
-Indexes all code files without requiring any project restructuring.
-Use for quick code understanding and bug hunting in any codebase.
-
-### Strategy B: Thin-wrapper integration
-Wrap existing code behind a `handler(input:dict)->dict` interface without
-modifying the original logic:
-```python
-# source/modules/legacy_gateway/gateway.py
-import subprocess
-def handler(d):
-    result = subprocess.run(["go", "run", "../../server.go"], ...)
-    return {"result": result.stdout}
-```
-Add a `module.json` declaring the interface — the old code stays untouched.
-
-### Strategy C: Progressive migration
-1. Run `module_search_loose()` to understand the codebase
-2. Generate AIexplain cards for key modules (manual or via aiexplain_generate)
-3. Wrap one subsystem at a time behind handler interfaces
-4. Use `module_bootstrap()` for new modules going forward
-5. Every wrapped module gets `module_validate()` + AIexplain card
-
-## Summary for Your System Prompt
-
-You are working in a micro-module architecture project.
-- **Discover**: `module_discover()` — one call, full picture
-- **Create**: `module_create(name, language)` — scaffold
-- **Sync**: `aiexplain_generate()` — regenerate knowledge layer
-- **Read first**: AIexplain cards — faster, more semantic
-- **Modify last**: source code — only when you know what to change
-- **Always close the loop**: modify → sync → next agent benefits
