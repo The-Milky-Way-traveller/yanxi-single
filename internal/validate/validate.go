@@ -209,6 +209,14 @@ func ValidateModule(root, modName string) Result {
 			fmt.Sprintf("Module name %q is vague. Use a domain-specific name like 'auth' or 'storage' instead.", modName))
 	}
 
+	// Check for generic description
+	if ifaceRaw != nil {
+		if desc, _ := ifaceRaw["description"].(string); desc == "" || strings.Contains(desc, modName+" module") || strings.Contains(desc, "entry (auto-synced)") {
+			r.Warnings = append(r.Warnings,
+				fmt.Sprintf("Module %q has a generic description. Update module.json's interface.description to explain what this module does and why it exists.", modName))
+		}
+	}
+
 	// ── Error declarations (v5.3.0) ──
 	if errDecls, ok := contract["errors"].(map[string]interface{}); ok {
 		for errCode := range errDecls {

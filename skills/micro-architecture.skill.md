@@ -94,6 +94,22 @@ validate found warnings   → Agent reads warnings → decides whether to act
 validate suggests changes → Agent runs module_sync() to apply them
 ```
 
+### Always Write Meaningful Descriptions
+
+When creating or modifying a module, write a real description in `module.json` `interface.description`. Generic text like "auth module" or "xxx entry (auto-synced)" is worthless to the next agent.
+
+Write what this module does, why it exists separately, and any key behaviors:
+
+```json
+{
+  "interface": {
+    "description": "配置管理模块，负责加载/保存应用配置。依赖: 无。被5模块依赖。"
+  }
+}
+```
+
+`module_validate()` warns if descriptions are generic. Don't run `aiexplain_generate()` until descriptions are meaningful — the AIexplain cards are only as useful as the descriptions you write.
+
 ### Adding a new module
 ```
 module_create("name", language="go") → write handler → module_validate → module_wire
