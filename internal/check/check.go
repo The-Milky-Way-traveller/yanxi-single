@@ -72,7 +72,7 @@ func Imports(root, modName string) ImportResult {
 	var importRe *regexp.Regexp
 	switch lang {
 	case "go":
-		importRe = regexp.MustCompile(`"source/modules/(\w+)(?:/\w+)?[""]`)
+		importRe = regexp.MustCompile(`"(?:\w+/)?source/modules/(\w+)(?:/\w+)?[""]`)
 	case "typescript", "javascript":
 		importRe = regexp.MustCompile(`(?:from|require)\s*\(\s*['"].*source/modules/(\w+)/\w+['"]\s*\)`)
 	default:

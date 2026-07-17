@@ -263,10 +263,16 @@ func ValidateModule(root, modName string) Result {
 
 	// ── Version Auto-Bump (v1.0.0) ──
 	if hasBreakingVersion(r.BreakingChanges) {
-		bumpVersion(contract, "major")
-		// Write back updated module.json
-		if newData, err := json.MarshalIndent(contract, "", "  "); err == nil {
-			os.WriteFile(modJSONPath, newData, 0644)
+		// Re-read to preserve entry/calls auto-sync changes
+		vdata, verr := os.ReadFile(modJSONPath)
+		if verr == nil {
+			var vcontract map[string]interface{}
+			if json.Unmarshal(vdata, &vcontract) == nil {
+				bumpVersion(vcontract, "major")
+				if nd, e := json.MarshalIndent(vcontract, "", "  "); e == nil {
+					os.WriteFile(modJSONPath, nd, 0644)
+				}
+			}
 		}
 		r.Warnings = append(r.Warnings, "Version auto-bumped to major (breaking changes)")
 	}
@@ -1033,7 +1039,17 @@ func inferModuleCalls(src, currentModule, lang string) []string {
 
 // autoSyncCalls writes discovered calls into module.json's interface.calls.
 func autoSyncCalls(root, modName string, contract map[string]interface{}, inferred []string) {
-	ifaceRaw, _ := contract["interface"].(map[string]interface{})
+	// Re-read the file to get latest state (entries may have been auto-synced first)
+	modJSONPath := filepath.Join(root, "source", "modules", modName, "module.json")
+	data, err := os.ReadFile(modJSONPath)
+	if err != nil {
+		return
+	}
+	var fresh map[string]interface{}
+	if json.Unmarshal(data, &fresh) != nil {
+		return
+	}
+	ifaceRaw, _ := fresh["interface"].(map[string]interface{})
 	if ifaceRaw == nil {
 		return
 	}
@@ -1065,9 +1081,8 @@ func autoSyncCalls(root, modName string, contract map[string]interface{}, inferr
 		}
 	}
 
-	// Write back
-	modJSONPath := filepath.Join(root, "source", "modules", modName, "module.json")
-	if newData, err := json.MarshalIndent(contract, "", "  "); err == nil {
+	// Write back (use fresh to preserve entry auto-sync changes)
+	if newData, err := json.MarshalIndent(fresh, "", "  "); err == nil {
 		os.WriteFile(modJSONPath, newData, 0644)
 	}
 }
