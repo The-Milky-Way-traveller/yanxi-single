@@ -877,6 +877,7 @@ func BuildOverview(ov ProjectOverview) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("## Project: %s\n\n", ov.ProjectDir))
 	if ov.HasINDEX { b.WriteString("INDEX.md: ✓\n") }
+
 	if ov.ProjectSummary != "" {
 		b.WriteString("\n### Project Summary\n\n" + ov.ProjectSummary + "\n\n")
 	}

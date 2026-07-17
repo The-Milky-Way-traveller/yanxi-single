@@ -127,6 +127,10 @@ func main() {
 				"middleware_issues": r.MiddlewareIssues,
 				"transport_issues": r.TransportIssues,
 				"convention_issues": r.ConventionIssues,
+				"lifecycle": r.Lifecycle,
+				"error_declarations": r.ErrorDecls,
+				"streaming_entries": r.StreamingEntries,
+				"import_scan": r.ImportScan,
 				"next_step": ns,
 			}
 			return result, nil
@@ -279,15 +283,20 @@ func main() {
 		mcp.ToolSchema{Type: "object", Properties: map[string]mcp.PropertySpec{
 			"kind": {Type: "string", Description: "adr | lesson | convention", Required: true},
 			"content": {Type: "string", Description: "Content to append", Required: true},
+			"scope": {Type: "string", Description: "project (default) | global — writes to ~/.yanxi/memory/"},
 			"project_dir": {Type: "string", Description: "Project root"},
 		}, Required: []string{"kind", "content"}},
 		func(args map[string]interface{}) (interface{}, error) {
 			kind, _ := args["kind"].(string)
 			content, _ := args["content"].(string)
+			scope, _ := args["scope"].(string)
 			projectDir, _ := args["project_dir"].(string)
 			if projectDir == "" { projectDir = "." }
-			if err := orchestrator.MemoryWrite(projectDir, kind, content); err != nil {
-				return nil, err
+			var memArgs []string
+			if scope == "global" {
+				memArgs = []string{"global"}
+			}
+			if err := orchestrator.MemoryWrite(projectDir, kind, content, memArgs...); err != nil {
 			}
 			return map[string]interface{}{"status": "written", "kind": kind, "next_step": "module_discover() to see updated memory."}, nil
 		},

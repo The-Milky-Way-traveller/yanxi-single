@@ -225,7 +225,7 @@ source/modules/auth/
 
 ## Current Status
 
-Yanxi is **early but working**. I'm using it to develop a 14-module desktop application — the validation pipeline catches real mistakes daily.
+Yanxi is **early but working**. I'm using it to develop a desktop application — the validation pipeline catches real mistakes daily.
 
 **What works well:**
 - Three-layer project discovery (50 modules → ~800 tokens)
